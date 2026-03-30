@@ -1,0 +1,22 @@
+[package]
+name = "unfourier"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "unfourier"
+path = "src/main.rs"
+
+[lib]
+name = "unfourier"
+path = "src/lib.rs"
+
+[dependencies]
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+# Linear algebra (matrices, SVD, etc.)
+nalgebra = "0.33"
+# Ergonomic error handling in binaries
+anyhow = "1"
+# Typed errors in the library
+thiserror = "2"
