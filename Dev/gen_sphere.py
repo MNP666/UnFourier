@@ -82,8 +82,11 @@ def main() -> None:
         help="Number of q points (default: 200)",
     )
     parser.add_argument(
-        "--noise", type=float, default=0.0, metavar="FRAC",
-        help="Relative noise level, e.g. 0.05 = 5%% (default: 0 = noiseless)",
+        "--k", type=float, default=None, metavar="K",
+        help=(
+            "Noise scale factor: σ(q) = I(q) / k, then I_noisy = I + N(0, σ). "
+            "Higher k = less noise. Omit for a noiseless dataset with dummy σ."
+        ),
     )
     parser.add_argument(
         "--log-spacing", action="store_true",
@@ -110,12 +113,13 @@ def main() -> None:
     # Analytic intensity, normalised to I(0) = 1
     intensity = sphere_intensity(q, args.radius)
 
-    # Error model: constant relative noise floor
-    # σ_i = noise_level × I_i  (with a small absolute floor to avoid zeros)
-    if args.noise > 0.0:
-        sigma = args.noise * intensity
-        sigma = np.maximum(sigma, 1e-6 * intensity.max())
-        intensity = intensity + rng.normal(0.0, sigma)
+    # Error model: σ(q) = I(q) / k  (proportional, Poisson-like approximation).
+    # This gives realistic heteroscedastic errors: large absolute σ at low q
+    # where I is high, small absolute σ at high q where I is low — matching
+    # counting-statistics behaviour in real SAXS experiments.
+    if args.k is not None:
+        sigma = intensity / args.k
+        intensity = intensity + rng.normal(loc=0.0, scale=sigma)
     else:
         # Noiseless: assign a small dummy σ so the parser always gets 3 columns
         sigma = np.full_like(intensity, 0.001 * intensity.max())
@@ -123,9 +127,10 @@ def main() -> None:
     # Write output
     out = sys.stdout if args.output == "-" else open(args.output, "w")
     try:
+        noise_desc = f"k = {args.k}" if args.k is not None else "noiseless"
         print(
             f"# Synthetic SAXS: solid sphere R = {args.radius} Å, "
-            f"noise = {args.noise:.3f}, seed = {args.seed}",
+            f"{noise_desc}, seed = {args.seed}",
             file=out,
         )
         print(f"# {'q(1/A)':>14}  {'I(q)':>14}  {'sigma(q)':>14}", file=out)

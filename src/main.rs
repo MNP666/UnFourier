@@ -6,7 +6,7 @@ use unfourier::{
     basis::{BasisSet, UniformGrid},
     data::parse_dat,
     kernel::build_weighted_system,
-    output::{print_summary, write_pr_to_file, write_pr_to_stdout},
+    output::{print_summary, write_fit_to_file, write_pr_to_file, write_pr_to_stdout},
     preprocess::{Identity, PreprocessingPipeline},
     solver::{LeastSquaresSvd, Solver},
 };
@@ -34,6 +34,11 @@ struct Args {
     /// Write P(r) to this file. Defaults to stdout.
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Write back-calculated fit (q, I_obs, I_calc, sigma) to this file.
+    /// Useful for checking how well the solution reproduces the measured data.
+    #[arg(long)]
+    fit_output: Option<PathBuf>,
 
     /// Print diagnostic summary (χ², D_max estimate, peak position) to stderr.
     #[arg(short, long)]
@@ -122,6 +127,13 @@ fn main() -> Result<()> {
             }
         }
         None => write_pr_to_stdout(&solution)?,
+    }
+
+    if let Some(fit_path) = &args.fit_output {
+        write_fit_to_file(fit_path, &solution, &data.q, &data.intensity, &data.error)?;
+        if args.verbose {
+            eprintln!("Fit written to '{}'", fit_path.display());
+        }
     }
 
     Ok(())

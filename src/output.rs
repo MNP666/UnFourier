@@ -49,6 +49,46 @@ pub fn write_pr_to_stdout(solution: &Solution) -> Result<()> {
     write_pr(&mut handle, solution)
 }
 
+/// Write the back-calculated fit (q, I_obs, I_calc, sigma) to a writer.
+///
+/// This lets you check how well the solution reproduces the measured data.
+/// A good fit to I(q) with a bad P(r) is a sign of over-fitting (M1 without
+/// regularisation). A slightly worse fit with a smooth P(r) is expected and
+/// desirable once Tikhonov regularisation is added in M2.
+pub fn write_fit<W: Write>(
+    writer: &mut W,
+    solution: &Solution,
+    q: &[f64],
+    i_obs: &[f64],
+    sigma: &[f64],
+) -> Result<()> {
+    writeln!(
+        writer,
+        "# {:>14}  {:>14}  {:>14}  {:>14}",
+        "q(1/A)", "I_obs", "I_calc", "sigma"
+    )?;
+    for i in 0..q.len() {
+        writeln!(
+            writer,
+            "  {:>14.6e}  {:>14.6e}  {:>14.6e}  {:>14.6e}",
+            q[i], i_obs[i], solution.i_calc[i], sigma[i]
+        )?;
+    }
+    Ok(())
+}
+
+/// Write the fit to a file at the given path.
+pub fn write_fit_to_file<P: AsRef<Path>>(
+    path: P,
+    solution: &Solution,
+    q: &[f64],
+    i_obs: &[f64],
+    sigma: &[f64],
+) -> Result<()> {
+    let mut file = std::fs::File::create(path.as_ref())?;
+    write_fit(&mut file, solution, q, i_obs, sigma)
+}
+
 /// Print a brief diagnostic summary to stderr.
 pub fn print_summary(solution: &Solution) {
     let p_max = solution.p_r.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -63,7 +103,7 @@ pub fn print_summary(solution: &Solution) {
         .r
         .iter()
         .zip(solution.p_r.iter())
-        .filter(|(_, &p)| p > 0.0)
+        .filter(|&(_, &p)| p > 0.0)
         .last()
         .map(|(&r, _)| r)
         .unwrap_or(0.0);
