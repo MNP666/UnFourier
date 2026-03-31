@@ -40,16 +40,30 @@ without restructuring.
 
 ## Validation strategy
 
-Every milestone includes validation against a **synthetic test case** with a known
-analytical answer. The simplest is a solid sphere of radius R, which has:
+Every milestone validates against two complementary synthetic fixtures.
 
-- Analytic I(q) = [3(sin(qR) - qR·cos(qR)) / (qR)³]²
-- Analytic P(r) = a piecewise polynomial on [0, 2R]
+**Sphere — noiseless only.** A solid sphere of radius R has fully analytic answers:
 
-Generate synthetic I(q) with optional Gaussian noise using a Python script in
-`Dev/` (easier to iterate on noise models and plot results). This costs almost
-nothing to build and catches numerical bugs immediately — before they compound
-across milestones.
+- I(q) = [3(sin(qR) − qR·cos(qR)) / (qR)³]²
+- P(r) = piecewise polynomial on [0, 2R]
+
+This is the sharpest test of kernel correctness and solver numerics. It is used
+*without noise* only. With a proportional noise model σ = I/k, the sphere becomes
+brittle: I(q) has true zeros where σ → 0 and the weight matrix W = diag(1/σ²)
+diverges. This causes the dominant eigenvalues of KᵀWK to blow up, making any
+finite λ irrelevant (λ_eff = λh/(μ + λh) → 0 as μ → ∞). The solver then
+"nails" the near-zero minima at the expense of the rest of the fit.
+See `saxs_ift_postmortem.md` for the full mathematical analysis.
+
+**Debye/Gaussian chain — primary noisy fixture.** A polymer chain with radius of
+gyration Rg has:
+
+- I(q) = 2(e^{−x} − 1 + x) / x²,  x = (qRg)²
+- P(r) ∝ r² exp(−3r²/4Rg²)   (Gaussian, no zeros)
+
+I(q) decays monotonically with no zeros, so σ = I/k is bounded away from zero
+for all q and the weight matrix stays well-conditioned. This is the standard
+noisy benchmark from M2 onwards. Scripts for both fixtures live in `Dev/`.
 
 ---
 
@@ -132,15 +146,20 @@ to parallelise the λ grid search in M3.
 
 Python (`Dev/`):
 - Update `gen_sphere.py` to support multiple noise levels via CLI args
-- `compare_pr.py`: overlay computed P(r) against analytic, compute χ² and
-  integrated squared error
+- `gen_debye.py` already exists — no changes needed
+- `compare_pr.py`: overlay computed P(r) against analytic reference, compute χ²
+  and integrated squared error
 
-**Validation:** Run on sphere data with moderate noise. With a well-chosen λ,
-P(r) should closely match the analytic pair-distance distribution. Compare
-visually and by metrics using `compare_pr.py`.
+**Validation:**
+- *Noiseless sphere:* P(r) should match the analytic piecewise polynomial closely.
+- *Noisy Debye (k = 5):* With a well-chosen λ, P(r) should track the Gaussian
+  reference from `debye_pr_ref.dat`. Use `compare_pr.py` for both.
 
-**Definition of done:** `unfourier --lambda 0.01 --rmax 100 sphere.dat` produces
-a smooth, non-negative P(r) that matches the known sphere result.
+The sphere noiseless case confirms the kernel and regulariser are correct.
+The Debye noisy case is the real benchmark for numerical robustness.
+
+**Definition of done:** `unfourier --lambda 0.01 --rmax 180 Dev/debye_k5.dat`
+produces a smooth, non-negative P(r) that visually matches the Debye reference.
 
 ---
 
@@ -170,16 +189,17 @@ Rust:
 - Automatic r_max estimation (π / q_min as starting guess, with `--rmax` override)
 
 Python (`Dev/`):
-- `sweep_noise.py`: run unFourier at multiple noise levels, collect and plot
-  the selected λ and resulting P(r) quality metrics
-- Add a second fixture: hollow sphere or core-shell particle
+- `sweep_noise.py`: run unFourier on Debye data at multiple noise levels (k = 3,
+  5, 10, 20), collect the auto-selected λ and P(r) quality metrics, plot
+- Add a third fixture for generalisation testing: hollow sphere or core-shell
+  particle (noiseless, to test a bimodal P(r))
 
-**Validation:** Run on sphere data at multiple noise levels. The automatic λ
-should produce results comparable to the best hand-tuned λ. Test on the second
-synthetic case to check generalisation.
+**Validation:** Run on Debye data across the noise sweep. The automatic λ should
+track the best hand-tuned λ from M2. Also run on the noiseless sphere and the
+new fixture to confirm the selector generalises.
 
-**Definition of done:** `unfourier sphere.dat` (no manual λ) produces a good P(r)
-across a range of noise levels.
+**Definition of done:** `unfourier Dev/debye_k5.dat` (no manual λ) produces a
+good P(r) across the noise sweep.
 
 ---
 

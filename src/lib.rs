@@ -1,6 +1,9 @@
 pub mod basis;
 pub mod data;
 pub mod kernel;
+pub mod lambda_select;
+pub mod nonneg;
 pub mod output;
 pub mod preprocess;
+pub mod regularise;
 pub mod solver;
