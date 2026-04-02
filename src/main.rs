@@ -7,8 +7,8 @@ use unfourier::{
     data::parse_dat,
     kernel::build_weighted_system,
     lambda_select::{
-        estimate_lambda_range, evaluate_lambda_grid, log_lambda_grid, GcvSelector,
-        GridMatrices, LCurveSelector, LambdaSelector,
+        estimate_lambda_range, evaluate_lambda_grid, log_lambda_grid, posterior_sigma,
+        BayesianEvidence, GcvSelector, GridMatrices, LCurveSelector, LambdaSelector,
     },
     output::{print_summary, write_fit_to_file, write_pr_to_file, write_pr_to_stdout},
     preprocess::{Identity, PreprocessingPipeline},
@@ -26,6 +26,8 @@ enum Method {
     Gcv,
     /// Find the corner of the L-curve (log residual vs log solution norm).
     Lcurve,
+    /// Maximise the Bayesian log-evidence (BayesApp-style).
+    Bayes,
     /// Supply λ manually via --lambda. Requires --lambda to be set.
     Manual,
 }
@@ -44,6 +46,7 @@ struct Args {
     /// λ selection method.
     /// 'gcv'    — minimise generalised cross-validation score (default).
     /// 'lcurve' — find corner of maximum curvature on the L-curve.
+    /// 'bayes'  — maximise Bayesian log-evidence; also produces error bars (M4).
     /// 'manual' — use the value supplied by --lambda directly.
     ///
     /// If --lambda is given without --method, 'manual' is implied.
@@ -177,7 +180,7 @@ fn main() -> Result<()> {
         }
 
         // -- Automatic: evaluate λ grid, select best --------------------------
-        Method::Gcv | Method::Lcurve => {
+        Method::Gcv | Method::Lcurve | Method::Bayes => {
             let matrices = GridMatrices::build(
                 &k_weighted,
                 &i_weighted,
@@ -192,27 +195,24 @@ fn main() -> Result<()> {
             let lam_max = args.lambda_max.unwrap_or(default_max);
             let grid = log_lambda_grid(lam_min, lam_max, args.lambda_count);
 
-            let method_name = match method {
-                Method::Gcv => "gcv",
-                Method::Lcurve => "lcurve",
+            let selector: Box<dyn LambdaSelector> = match method {
+                Method::Gcv => Box::new(GcvSelector),
+                Method::Lcurve => Box::new(LCurveSelector),
+                Method::Bayes => Box::new(BayesianEvidence),
                 Method::Manual => unreachable!(),
             };
 
             if args.verbose {
                 eprintln!(
                     "  method: {}  grid: {} pts in [{:.2e}, {:.2e}]",
-                    method_name, args.lambda_count, lam_min, lam_max
+                    selector.name(),
+                    args.lambda_count,
+                    lam_min,
+                    lam_max
                 );
             }
 
             let evaluations = evaluate_lambda_grid(&grid, &matrices)?;
-
-            let selector: Box<dyn LambdaSelector> = match method {
-                Method::Gcv => Box::new(GcvSelector),
-                Method::Lcurve => Box::new(LCurveSelector),
-                Method::Manual => unreachable!(),
-            };
-
             let best_idx = selector.select(&evaluations);
             let best = &evaluations[best_idx];
 
@@ -221,20 +221,32 @@ fn main() -> Result<()> {
                     "  selected λ = {:.3e}  (λ_eff = {:.3e})",
                     best.lambda, best.lambda_eff
                 );
+                // Score column label and value differ by method.
+                let is_bayes = matches!(method, Method::Bayes);
+                let score_label = if is_bayes { "log_evid" } else { "GCV" };
                 eprintln!(
                     "  {:>8}  {:>12}  {:>12}  {:>10}  {:>10}",
-                    "λ", "λ_eff", "GCV", "RSS_w", "χ²_red"
+                    "λ", "λ_eff", score_label, "RSS_w", "χ²_red"
                 );
                 for (i, e) in evaluations.iter().enumerate() {
                     let marker = if i == best_idx { " ←" } else { "" };
+                    let score = if is_bayes { e.log_evidence } else { e.gcv };
                     eprintln!(
                         "  {:>8.2e}  {:>12.3e}  {:>12.4e}  {:>10.3e}  {:>10.4}{marker}",
-                        e.lambda, e.lambda_eff, e.gcv, e.rss_weighted, e.chi_squared
+                        e.lambda, e.lambda_eff, score, e.rss_weighted, e.chi_squared
                     );
                 }
             }
 
-            best.solution.clone()
+            let mut solution = best.solution.clone();
+
+            // Bayesian posterior error bars: σ_P(r) = sqrt(diag(Σ))
+            // where Σ = (KᵀWK + λ_eff LᵀL)^{-1}.
+            if matches!(method, Method::Bayes) {
+                solution.p_r_err = Some(posterior_sigma(&matrices, best.lambda_eff)?);
+            }
+
+            solution
         }
     };
 

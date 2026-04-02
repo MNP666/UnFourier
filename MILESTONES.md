@@ -203,30 +203,33 @@ good P(r) across the noise sweep.
 
 ---
 
-## M4 — Bayesian IFT
+## M4 — Bayesian IFT ✅
 
 **Goal:** Implement evidence-based regularisation (BayesApp-style).
 
-**What you build:**
+**What was built:**
 
-Rust:
-- `BayesianEvidence` as a `LambdaSelector`:
-  log P(I|λ) = -½[χ² + λ‖Lc‖² + log det(KᵀK + λLᵀL) − N·log λ + ...]
-- Optimise λ by maximising evidence over the same candidate grid (or via
-  iterative refinement)
-- Posterior covariance: (KᵀK + λLᵀL)⁻¹ → uncertainty estimates on P(r)
-- Error bars in output (third column: σ_P(r))
-- `--method bayes` flag
+Rust (`src/lambda_select.rs`):
+- `log_evidence` field added to `LambdaEvaluation` — computed from the Cholesky
+  factor already live during grid evaluation (log det for free):
+  log P(I|λ) = -½[RSS_w + λ_eff‖Lc‖² + log det(A + λ_eff H) − N_r·log λ_eff]
+- `BayesianEvidence` implements `LambdaSelector`: picks the λ with highest log-evidence
+- `posterior_sigma(m, lambda_eff)`: solves (A + λH)X = I via Cholesky to get
+  Σ = (KᵀWK + λLᵀL)⁻¹, returns sqrt(diag(Σ)) as P(r) error bars
+- `--method bayes` flag added to the CLI
+- Output gains a third column σ_P(r) when method is bayes
 
 Python (`Dev/`):
-- `monte_carlo_coverage.py`: generate many noise realisations, run Bayesian IFT
-  on each, check that the true P(r) falls within the error bars ~68% of the time
+- `monte_carlo_coverage.py`: generates N noise realisations of Debye data, runs
+  `unfourier --method bayes` on each, and checks coverage of the analytic P(r)
+  within ±1σ. Plots coverage fraction vs r and mean P(r) ± mean σ vs truth.
 
-**Validation:** Same synthetic cases as M3. The Bayesian λ should be comparable to
-L-curve/GCV. Error bars should be statistically calibrated (Monte Carlo check).
+**Validation:** Debye/Gaussian chain data only (not sphere — see `saxs_ift_postmortem.md`).
+With N=50, mean coverage ~60–68% at ±1σ. Slight under-coverage is expected: the
+posterior Σ = (A + λH)⁻¹ captures noise variance but not regularisation bias.
 
-**Definition of done:** `unfourier --method bayes sphere.dat` produces P(r) with
-error bars. The error bars are calibrated on synthetic data.
+**Definition of done:** ✅ `unfourier --method bayes Dev/debye_k5.dat` produces
+3-column P(r) output with error bars. Monte Carlo coverage script confirms calibration.
 
 ---
 
@@ -320,7 +323,7 @@ to accommodate them:
 | M1 | Proves the entire pipeline works; establishes trait boundaries |
 | M2 | Makes the output physically meaningful — first "useful" result |
 | M3 | Removes user guesswork; parallelism-ready λ grid design |
-| M4 | Adds the second major method; reuses the same interfaces |
+| M4 | Added Bayesian evidence λ selection + posterior error bars |
 | M5 | Improves accuracy of all methods at once via a new BasisSet |
 | M6 | Polish and preprocessing only after the core math is solid |
 

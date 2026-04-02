@@ -108,6 +108,10 @@ pub struct LambdaEvaluation {
     /// Lower is better. Minimise over λ to select.
     pub gcv: f64,
 
+    /// Bayesian log-evidence: log P(I|λ) = -½[RSS_w + λ_eff‖Lc‖² + log det(A + λ_eff H) − N_r log λ_eff]
+    /// Higher is better. Maximise over λ to select (used by `BayesianEvidence` in M4).
+    pub log_evidence: f64,
+
     /// Reduced χ² from the non-negativity-enforced solution (for display).
     pub chi_squared: f64,
 
@@ -233,6 +237,53 @@ impl LambdaSelector for LCurveSelector {
         }
 
         best_idx
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BayesianEvidence
+// ---------------------------------------------------------------------------
+
+/// Selects λ by maximising the Bayesian log-evidence log P(I|λ).
+///
+/// The evidence marginalises over the P(r) coefficients, yielding an objective
+/// that balances data fit and prior smoothness without requiring a separate
+/// criterion (GCV, L-curve). The formula evaluated per candidate is:
+///
+/// ```text
+/// log P(I|λ) = -½ [ RSS_w + λ_eff‖Lc‖² + log det(A + λ_eff H) − N_r log λ_eff ]
+/// ```
+///
+/// where A = KᵀWK, H = LᵀL, RSS_w is the weighted residual at the MAP
+/// solution c*(λ), and N_r is the number of basis coefficients.
+///
+/// The log det term is obtained for free from the Cholesky factor already
+/// computed during grid evaluation: log det(M) = 2 Σ_i log L_{ii}.
+///
+pub struct BayesianEvidence;
+
+impl LambdaSelector for BayesianEvidence {
+    fn name(&self) -> &str {
+        "bayes"
+    }
+
+    /// Return the index of the candidate with the highest log-evidence.
+    ///
+    /// Non-finite values (e.g. from a degenerate λ = 0) are excluded.
+    /// Falls back to index 0 only if no finite value is found.
+    fn select(&self, candidates: &[LambdaEvaluation]) -> usize {
+        assert!(!candidates.is_empty(), "LambdaEvaluation slice is empty");
+        candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.log_evidence.is_finite())
+            .max_by(|(_, a), (_, b)| {
+                a.log_evidence
+                    .partial_cmp(&b.log_evidence)
+                    .unwrap()
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0)
     }
 }
 
@@ -379,6 +430,22 @@ pub fn evaluate_lambda_grid(
             c_unconstrained.dot(&ltl_c)
         };
 
+        // log_evidence = -½ [ RSS_w + λ_eff‖Lc‖² + log det(A + λ_eff H) − N_r log λ_eff ]
+        //
+        // log det(A + λ_eff H) = 2 Σ_i log L_{ii}  where  mat = L Lᵀ (Cholesky).
+        // All diagonal elements of L are positive by construction.
+        let log_evidence = {
+            let log_det_a = 2.0
+                * chol
+                    .l()
+                    .diagonal()
+                    .iter()
+                    .map(|&x| x.ln())
+                    .sum::<f64>();
+            -0.5 * (rss_weighted + lambda_eff * solution_norm + log_det_a
+                - n_r as f64 * lambda_eff.ln())
+        };
+
         // df = tr(H) = tr((A + λ_eff H_reg)⁻¹ A)
         //            = n_r − λ_eff · tr(M⁻¹ H_reg)
         //
@@ -419,6 +486,7 @@ pub fn evaluate_lambda_grid(
             solution_norm,
             df,
             gcv,
+            log_evidence,
             chi_squared,
             solution: Solution {
                 r: m.r.clone(),
@@ -432,6 +500,50 @@ pub fn evaluate_lambda_grid(
     }
 
     Ok(evaluations)
+}
+
+// ---------------------------------------------------------------------------
+// Posterior covariance
+// ---------------------------------------------------------------------------
+
+/// Compute the marginal posterior standard deviations of the P(r) coefficients.
+///
+/// For the weighted Tikhonov problem the posterior covariance is:
+///
+/// ```text
+/// Σ = (KᵀWK + λ_eff LᵀL)⁻¹  =  (A + λ_eff H)⁻¹
+/// ```
+///
+/// The marginal σ for each coefficient is `sqrt(Σ_{jj})`.
+///
+/// # Computation
+///
+/// The inverse is obtained by solving `(A + λ_eff H) X = I` against the
+/// Cholesky factor of `A + λ_eff H` — the same factorisation already computed
+/// during grid evaluation.  This costs O(n_r³) but n_r is typically ~100 so
+/// it is negligible compared with the grid evaluation.
+///
+/// Note: `lambda_eff` must be the *effective* (scaled) λ stored in
+/// [`LambdaEvaluation::lambda_eff`], not the user-facing λ.
+pub fn posterior_sigma(m: &GridMatrices, lambda_eff: f64) -> Result<Vec<f64>> {
+    let n_r = m.r.len();
+    let mat = &m.ktk + &m.ltl * lambda_eff;
+
+    let chol = mat.cholesky().ok_or_else(|| {
+        anyhow!(
+            "Cholesky failed for posterior covariance at λ_eff = {:.3e}; \
+             matrix is not positive-definite",
+            lambda_eff
+        )
+    })?;
+
+    // Solve (A + λ_eff H) X = I  →  X = Σ = (A + λ_eff H)^{-1}
+    let identity = DMatrix::<f64>::identity(n_r, n_r);
+    let sigma_mat = chol.solve(&identity);
+
+    // Marginal std dev for each coefficient: sqrt(Σ_{jj})
+    let p_r_sigma: Vec<f64> = (0..n_r).map(|j| sigma_mat[(j, j)].max(0.0).sqrt()).collect();
+    Ok(p_r_sigma)
 }
 
 // ---------------------------------------------------------------------------
@@ -584,6 +696,7 @@ mod tests {
             solution_norm: 1.0,
             df: 5.0,
             gcv,
+            log_evidence: 0.0,
             chi_squared: 1.0,
             solution: Solution {
                 r: vec![],
@@ -599,6 +712,121 @@ mod tests {
         assert_eq!(GcvSelector.select(&evals), 1); // index 1 has minimum finite GCV
     }
 
+    /// Build the same tiny synthetic GridMatrices used in other tests.
+    fn make_test_matrices() -> GridMatrices {
+        use nalgebra::DMatrix;
+        let n_q = 8_usize;
+        let n_r = 5_usize;
+        let k_w = DMatrix::from_fn(n_q, n_r, |i, j| {
+            let x = (i + 1) as f64 * (j + 1) as f64 * 0.2;
+            x.sin() / x
+        });
+        let i_w: Vec<f64> = (1..=n_q).map(|i| (i as f64) * 0.05).collect();
+        let r: Vec<f64> = (1..=n_r).map(|i| i as f64 * 10.0).collect();
+        GridMatrices::build(&k_w, &i_w, &k_w.clone(), &i_w, &vec![1.0; n_q], &r)
+    }
+
+    #[test]
+    fn posterior_sigma_shape_and_sign() {
+        let m = make_test_matrices();
+        let lambda_eff = 1e6_f64; // large enough for Cholesky to be well-conditioned
+        let sigma = posterior_sigma(&m, lambda_eff).unwrap();
+
+        assert_eq!(sigma.len(), m.r.len(), "sigma length must match n_r");
+        assert!(
+            sigma.iter().all(|&s| s > 0.0 && s.is_finite()),
+            "all sigma values must be positive and finite"
+        );
+    }
+
+    #[test]
+    fn posterior_sigma_shrinks_with_lambda() {
+        // Larger λ → prior dominates → tighter posterior → smaller σ.
+        let m = make_test_matrices();
+        let sigma_small = posterior_sigma(&m, 1e4).unwrap();
+        let sigma_large = posterior_sigma(&m, 1e8).unwrap();
+
+        let sum_small: f64 = sigma_small.iter().sum();
+        let sum_large: f64 = sigma_large.iter().sum();
+        assert!(
+            sum_large < sum_small,
+            "larger λ should give smaller total uncertainty (got {sum_large:.3e} vs {sum_small:.3e})"
+        );
+    }
+
+    #[test]
+    fn bayes_selects_maximum_evidence() {
+        let make_eval = |log_evidence: f64| LambdaEvaluation {
+            lambda: 1.0,
+            lambda_eff: 1.0,
+            rss_weighted: 1.0,
+            solution_norm: 1.0,
+            df: 5.0,
+            gcv: 1.0,
+            log_evidence,
+            chi_squared: 1.0,
+            solution: Solution {
+                r: vec![],
+                p_r: vec![],
+                p_r_err: None,
+                i_calc: vec![],
+                chi_squared: 1.0,
+                lambda_effective: Some(1.0),
+            },
+        };
+
+        // Index 2 has the highest finite evidence; index 0 is non-finite.
+        let evals = vec![
+            make_eval(f64::NEG_INFINITY),
+            make_eval(-5.0),
+            make_eval(-2.0), // winner
+            make_eval(-4.0),
+        ];
+        assert_eq!(BayesianEvidence.select(&evals), 2);
+    }
+
+    /// Verify log_evidence stored in LambdaEvaluation matches the formula:
+    ///   -½ [ RSS_w + λ_eff‖Lc‖² + log det(A + λ_eff H) − N_r log λ_eff ]
+    ///
+    /// Strategy: run evaluate_lambda_grid on a tiny synthetic problem, then
+    /// independently recompute log det from the Cholesky of (ktk + λ_eff·ltl)
+    /// and compare to the stored value.
+    #[test]
+    fn log_evidence_matches_formula() {
+        let m = make_test_matrices();
+        let n_r = m.r.len();
+
+        let lambda = 0.01_f64;
+        let evals = evaluate_lambda_grid(&[lambda], &m).unwrap();
+        let ev = &evals[0];
+
+        // Recompute log det independently from the same matrix
+        let mat = &m.ktk + &m.ltl * ev.lambda_eff;
+        let chol = mat.cholesky().expect("Cholesky should succeed for this test matrix");
+        let log_det = 2.0
+            * chol
+                .l()
+                .diagonal()
+                .iter()
+                .map(|&x| x.ln())
+                .sum::<f64>();
+
+        let expected = -0.5
+            * (ev.rss_weighted + ev.lambda_eff * ev.solution_norm + log_det
+                - n_r as f64 * ev.lambda_eff.ln());
+
+        assert!(
+            ev.log_evidence.is_finite(),
+            "log_evidence should be finite"
+        );
+        assert!(
+            (ev.log_evidence - expected).abs() < 1e-10,
+            "log_evidence {:.6e} does not match formula {:.6e}",
+            ev.log_evidence,
+            expected
+        );
+    }
+
     #[test]
     fn lcurve_avoids_boundaries() {
         // A curve of 5 points — corner detection should not return index 0 or 4.
@@ -609,6 +837,7 @@ mod tests {
             solution_norm: snorm,
             df: 5.0,
             gcv: 1.0,
+            log_evidence: 0.0,
             chi_squared: 1.0,
             solution: Solution {
                 r: vec![],
