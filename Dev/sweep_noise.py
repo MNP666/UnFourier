@@ -227,51 +227,92 @@ def main() -> None:
 
     # ---- Plots ----
     noise_levels = sorted(set(results["k"]))
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    n_k = len(noise_levels)
+
+    # Colour palette: one colour per noise level, shared across all panels
+    cmap = plt.cm.viridis
+    colors = [cmap(i / max(n_k - 1, 1)) for i in range(n_k)]
+
+    # Layout: 3 rows × 2 columns
+    #   Row 0 (GCV)    : col 0 = P(r),  col 1 = I(q) fits
+    #   Row 1 (L-curve): col 0 = P(r),  col 1 = I(q) fits
+    #   Row 2          : col 0 = λ vs noise,  col 1 = ISE vs noise
+    fig, axes = plt.subplots(3, 2, figsize=(13, 10))
     fig.suptitle(
-        f"M3 sweep — Debye chain Rg = {args.rg} Å, r_max = {args.rmax} Å",
-        fontsize=12
+        f"M3 sweep — Debye chain  Rg = {args.rg} Å,  r_max = {args.rmax} Å",
+        fontsize=13, y=0.995
     )
 
-    # Panel 1: P(r) comparison for GCV method
-    ax = axes[0]
-    ax.plot(r_ref, pr_ref / pr_ref.max(), "k--", lw=2, label="Reference", zorder=5)
-    cmap = plt.cm.viridis
-    for i, k in enumerate(noise_levels):
-        pr_out = tmp / f"pr_gcv_k{k:.0f}.dat"
-        if not pr_out.exists():
-            continue
-        r_calc, pr_calc = load_two_col(pr_out)
-        peak = pr_calc.max()
-        color = cmap(i / max(len(noise_levels) - 1, 1))
-        ax.plot(r_calc, pr_calc / max(peak, 1e-12), color=color, label=f"k={k:.0f}")
-    ax.set_xlabel("r (Å)")
-    ax.set_ylabel("P(r)  [normalised]")
-    ax.set_title("P(r) — GCV selection")
-    ax.legend(fontsize=8)
-    ax.set_xlim(0, args.rmax)
-    ax.set_ylim(bottom=-0.05)
+    def plot_pr_panel(ax, method_name: str) -> None:
+        """Left panel: reference P(r) + recovered P(r) for each noise level."""
+        ax.plot(r_ref, pr_ref / pr_ref.max(), "k--", lw=2, label="Reference", zorder=5)
+        for i, k in enumerate(noise_levels):
+            pr_out = tmp / f"pr_{method_name}_k{k:.0f}.dat"
+            if not pr_out.exists():
+                continue
+            r_calc, pr_calc = load_two_col(pr_out)
+            peak = pr_calc.max()
+            ax.plot(r_calc, pr_calc / max(peak, 1e-12),
+                    color=colors[i], lw=1.5, label=f"k = {k:.0f}")
+        ax.set_xlabel("r (Å)")
+        ax.set_ylabel("P(r)  [normalised to peak]")
+        ax.set_title(f"P(r) — {method_name.upper()}")
+        ax.legend(fontsize=8)
+        ax.set_xlim(0, args.rmax)
+        ax.set_ylim(bottom=-0.05)
 
-    # Panel 2: selected λ vs noise level
-    ax = axes[1]
+    def plot_fit_panel(ax, method_name: str) -> None:
+        """Right panel: I(q) data as circles, back-calculated fit as line."""
+        for i, k in enumerate(noise_levels):
+            dat_file = tmp / f"debye_k{k:.0f}.dat"
+            fit_file = tmp / f"fit_{method_name}_k{k:.0f}.dat"
+            if not dat_file.exists() or not fit_file.exists():
+                continue
+
+            # Data: q, I, sigma
+            d = np.loadtxt(dat_file, comments="#")
+            q_data, i_data = d[:, 0], d[:, 1]
+
+            # Fit: q, I_obs, I_calc, sigma
+            f = np.loadtxt(fit_file, comments="#")
+            q_fit, i_calc = f[:, 0], f[:, 2]
+
+            ax.plot(q_data, i_data, "o", ms=2.5, color=colors[i],
+                    alpha=0.5, label=f"k = {k:.0f}")
+            ax.plot(q_fit, i_calc, "-", lw=1.5, color=colors[i])
+
+        ax.set_xlabel("q (Å⁻¹)")
+        ax.set_ylabel("I(q)")
+        ax.set_yscale("log")
+        ax.set_title(f"I(q) fits — {method_name.upper()}  (circles = data, lines = fit)")
+        ax.legend(fontsize=8, markerscale=2)
+
+    # Row 0: GCV
+    plot_pr_panel(axes[0, 0], "gcv")
+    plot_fit_panel(axes[0, 1], "gcv")
+
+    # Row 1: L-curve
+    plot_pr_panel(axes[1, 0], "lcurve")
+    plot_fit_panel(axes[1, 1], "lcurve")
+
+    # Row 2: summary metrics
     ks_unique = noise_levels
+
+    ax = axes[2, 0]
     ax.loglog(ks_unique, results["lam_gcv"],    "o-", label="GCV",     color="steelblue")
     ax.loglog(ks_unique, results["lam_lcurve"], "s-", label="L-curve", color="darkorange")
-    ax.set_xlabel("Noise level k  (σ = I/k)")
+    ax.set_xlabel("Noise level k  (σ = I/k,  higher k = less noise)")
     ax.set_ylabel("Selected λ")
-    ax.set_title("Auto-selected λ vs noise")
+    ax.set_title("Auto-selected λ vs noise level")
     ax.legend()
-    ax.invert_xaxis()  # decreasing k = increasing noise, left to right
 
-    # Panel 3: ISE vs noise level
-    ax = axes[2]
+    ax = axes[2, 1]
     ax.semilogy(ks_unique, results["ise_gcv"],    "o-", label="GCV",     color="steelblue")
     ax.semilogy(ks_unique, results["ise_lcurve"], "s-", label="L-curve", color="darkorange")
-    ax.set_xlabel("Noise level k  (σ = I/k)")
-    ax.set_ylabel("ISE (normalised)")
-    ax.set_title("Integrated Squared Error vs noise")
+    ax.set_xlabel("Noise level k  (σ = I/k,  higher k = less noise)")
+    ax.set_ylabel("ISE  (normalised, lower = better)")
+    ax.set_title("Integrated Squared Error vs noise level")
     ax.legend()
-    ax.invert_xaxis()
 
     plt.tight_layout()
     out_fig = tmp / "sweep_noise.png"
