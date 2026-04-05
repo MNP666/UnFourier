@@ -121,17 +121,17 @@ File: `src/main.rs`
 
 ### 6 — Validation
 
-- [ ] **Numerical match**: run the Rust B-spline kernel on a test q-grid and compare
+- [x] **Numerical match**: run the Rust B-spline kernel on a test q-grid and compare
       to the Python prototype. Max absolute difference < 1e-5.
-- [ ] **Boundary conditions**: assert P(0) ≈ 0 and P(r_max) ≈ 0 in the output for
+- [x] **Boundary conditions**: assert P(0) ≈ 0 and P(r_max) ≈ 0 in the output for
       all methods (GCV, L-curve, Bayes).
-- [ ] **Debye recovery**: `unfourier --basis spline Dev/debye_k5.dat` should produce
+- [x] **Debye recovery**: `unfourier --basis spline Dev/debye_k5.dat` should produce
       P(r) quality equal to or better than `--basis rect` with the same n_basis.
-- [ ] **Fewer parameters**: confirm that 20 spline basis functions gives comparable or
+- [x] **Fewer parameters**: confirm that 20 spline basis functions gives comparable or
       better P(r) quality than 100 rectangular bins on Debye data.
-- [ ] **All methods work**: verify GCV, L-curve, and Bayes all run to completion with
+- [x] **All methods work**: verify GCV, L-curve, and Bayes all run to completion with
       `--basis spline` and produce physically reasonable output.
-- [ ] **Sweep**: run `Dev/sweep_noise.py` with both bases and overlay the results.
+- [x] **Sweep**: run `Dev/sweep_noise.py` with both bases and overlay the results.
 
 ---
 

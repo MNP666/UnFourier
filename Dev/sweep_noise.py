@@ -58,7 +58,8 @@ def generate_debye(rg: float, k: float | None, outfile: Path, pr_ref: Path | Non
 
 def run_unfourier(unfourier_bin: str, dat_file: Path, pr_out: Path,
                   fit_out: Path, rmax: float, method: str,
-                  npoints: int = 200) -> dict:
+                  npoints: int = 200, basis: str = "rect",
+                  n_basis: int | None = None) -> dict:
     """
     Run unfourier and return selected λ, χ²_red parsed from verbose output.
 
@@ -68,12 +69,16 @@ def run_unfourier(unfourier_bin: str, dat_file: Path, pr_out: Path,
         unfourier_bin,
         str(dat_file),
         "--rmax", str(rmax),
-        "--npoints", str(npoints),
         "--method", method,
+        "--basis", basis,
         "--output", str(pr_out),
         "--fit-output", str(fit_out),
         "--verbose",
     ]
+    if basis == "rect":
+        cmd += ["--npoints", str(npoints)]
+    if n_basis is not None:
+        cmd += ["--n-basis", str(n_basis)]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"  ERROR running unfourier:\n{result.stderr}", file=sys.stderr)
@@ -130,8 +135,8 @@ def integrated_squared_error(r_calc: np.ndarray, pr_calc: np.ndarray,
     pr_ref_n  = pr_ref_interp  / peak_ref
     pr_calc_n = pr_calc_interp / peak_calc
 
-    ise_num   = np.trapz((pr_calc_n - pr_ref_n) ** 2, r_common)
-    ise_denom = np.trapz(pr_ref_n ** 2, r_common)
+    ise_num   = np.trapezoid((pr_calc_n - pr_ref_n) ** 2, r_common)
+    ise_denom = np.trapezoid(pr_ref_n ** 2, r_common)
     return ise_num / ise_denom if ise_denom > 0 else float("nan")
 
 
@@ -149,6 +154,10 @@ def main() -> None:
                         help="Path to the unfourier binary")
     parser.add_argument("--noise-levels", nargs="+", type=float, default=[3, 5, 10, 20],
                         help="Noise parameter k values to sweep (σ = I/k)")
+    parser.add_argument("--compare-spline", action="store_true",
+                        help="Also run --basis spline and overlay ISE on the summary plot")
+    parser.add_argument("--n-basis-spline", type=int, default=20,
+                        help="n_basis for the spline comparison (default: 20)")
     parser.add_argument("--no-plot",  action="store_true", help="Skip matplotlib output")
     args = parser.parse_args()
 
@@ -221,6 +230,45 @@ def main() -> None:
                 results["chi_lcurve"].append(chi)
 
     print()
+
+    # ---- Optional spline comparison sweep ----
+    spline_results: dict[str, list] = {
+        "k": [], "lam_gcv": [], "lam_lcurve": [],
+        "ise_gcv": [], "ise_lcurve": [],
+    }
+    if args.compare_spline:
+        print(
+            f"\n{'k':>4}  {'method':>10}  {'λ_sel':>10}  {'χ²_red':>8}  {'ISE':>10}"
+            f"  (spline, n_basis={args.n_basis_spline})"
+        )
+        print("-" * 60)
+        for k in args.noise_levels:
+            dat_file = tmp / f"debye_k{k:.0f}.dat"
+            for method in ("gcv", "lcurve"):
+                pr_out  = tmp / f"pr_spline_{method}_k{k:.0f}.dat"
+                fit_out = tmp / f"fit_spline_{method}_k{k:.0f}.dat"
+                info = run_unfourier(
+                    unfourier_bin, dat_file, pr_out, fit_out,
+                    args.rmax, method,
+                    basis="spline", n_basis=args.n_basis_spline,
+                )
+                if pr_out.exists():
+                    r_calc, pr_calc = load_two_col(pr_out)
+                    ise_val = integrated_squared_error(r_calc, pr_calc, r_ref, pr_ref)
+                else:
+                    ise_val = float("nan")
+                lam = info["lambda_selected"]
+                chi = info["chi_sq"]
+                print(f"{k:>4.0f}  {('spline-' + method):>10}  {lam:>10.3e}  "
+                      f"{chi:>8.4f}  {ise_val:>10.4e}")
+                spline_results["k"].append(k)
+                if method == "gcv":
+                    spline_results["lam_gcv"].append(lam)
+                    spline_results["ise_gcv"].append(ise_val)
+                else:
+                    spline_results["lam_lcurve"].append(lam)
+                    spline_results["ise_lcurve"].append(ise_val)
+        print()
 
     if args.no_plot:
         return
@@ -307,8 +355,14 @@ def main() -> None:
     ax.legend()
 
     ax = axes[2, 1]
-    ax.semilogy(ks_unique, results["ise_gcv"],    "o-", label="GCV",     color="steelblue")
-    ax.semilogy(ks_unique, results["ise_lcurve"], "s-", label="L-curve", color="darkorange")
+    ax.semilogy(ks_unique, results["ise_gcv"],    "o-", label="Rect GCV",     color="steelblue")
+    ax.semilogy(ks_unique, results["ise_lcurve"], "s-", label="Rect L-curve", color="darkorange")
+    if args.compare_spline and spline_results["ise_gcv"]:
+        sp_ks = sorted(set(spline_results["k"]))
+        ax.semilogy(sp_ks, spline_results["ise_gcv"],    "o--",
+                    label=f"Spline-{args.n_basis_spline} GCV",    color="mediumseagreen")
+        ax.semilogy(sp_ks, spline_results["ise_lcurve"], "s--",
+                    label=f"Spline-{args.n_basis_spline} L-curve", color="tomato")
     ax.set_xlabel("Noise level k  (σ = I/k,  higher k = less noise)")
     ax.set_ylabel("ISE  (normalised, lower = better)")
     ax.set_title("Integrated Squared Error vs noise level")
