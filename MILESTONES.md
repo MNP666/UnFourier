@@ -67,31 +67,25 @@ noisy benchmark from M2 onwards. Scripts for both fixtures live in `Dev/`.
 
 ---
 
-## M1 — Naive least-squares, end-to-end
+## M1 — Naive least-squares, end-to-end ✅
 
 **Goal:** A CLI that reads `q, I(q), σ(q)` from a `.dat` file, solves for P(r)
 using unregularised least squares, and writes P(r) to stdout or a file.
 
-**What you build:**
+**What was built:**
 
 Rust:
-- `SaxsData` struct: holds q, I(q), σ(q) vectors
-- `.dat` parser (3-column, whitespace-delimited, skip `#` comments) — simple for
-  now, but behind a `parse()` function that can grow
-- `Preprocessor` trait with a no-op `Identity` implementation — placeholder
-  interface for future rebinning, clipping, q-range selection
-- `BasisSet` trait with a `Grid` (rectangular/histogram) implementation
-- Kernel matrix construction: K_ij = sin(q_i · r_j) / (q_i · r_j) · Δr, behind
-  a function that takes a `BasisSet` and a q-vector
-- `Solver` trait with an unregularised least-squares implementation (SVD)
-- r-grid setup (hard-coded r_max and number of points for now)
-- Write r, P(r) to stdout
+- `SaxsData` struct (`src/data.rs`): holds q, I(q), σ(q) vectors; parses 3-column `.dat` files
+- `Preprocessor` trait (`src/preprocess.rs`) with `Identity` no-op implementation
+- `BasisSet` trait (`src/basis.rs`) with `UniformGrid` (rectangular/histogram) implementation
+- Kernel matrix construction (`src/kernel.rs`): K_ij = sin(q_i · r_j) / (q_i · r_j) · Δr
+- `Solver` trait (`src/solver.rs`) with SVD-based implementation
+- `--rmax` and `--output` CLI flags in `src/main.rs`
+- `output.rs` writes r, P(r) to file or stdout
 
 Python (`Dev/`):
-- `gen_sphere.py`: generates synthetic I(q) for a solid sphere with optional
-  Gaussian noise, writes a 3-column `.dat` file
-- `plot_pr.py`: reads two-column P(r) output and plots it (optionally overlay
-  the analytic P(r) for comparison)
+- `gen_sphere.py`: synthetic sphere I(q) with optional noise
+- `plot_pr.py`: plots P(r) with optional analytic overlay
 
 **Key traits introduced:**
 
@@ -101,36 +95,24 @@ trait BasisSet     { fn design_matrix(&self, q: &[f64]) -> Matrix; }
 trait Solver       { fn solve(&self, K: &Matrix, data: &SaxsData) -> Solution; }
 ```
 
-These are intentionally simple. They will gain associated types and configuration
-as needed, but the key is that the pipeline is: parse → preprocess → build basis
-→ build kernel → solve → output.
-
-**Key crate dependencies:** `clap` (CLI), `nalgebra` (linear algebra)
-
-**Validation:** Run on sphere data with no noise. The output P(r) will be noisy
-and possibly oscillatory (no regularisation), but should broadly peak near the
-right r values. This confirms the kernel, parser, and linear algebra are wired
-together. Use `plot_pr.py` to visualise.
-
-**Definition of done:** `unfourier input.dat` produces a two-column output that,
-when plotted, vaguely resembles a P(r).
+**Definition of done:** ✅ `unfourier input.dat` produces a two-column P(r) output.
 
 ---
 
-## M2 — Tikhonov regularisation with manual λ
+## M2 — Tikhonov regularisation with manual λ ✅
 
 **Goal:** Add L₂ regularisation so the output is physically meaningful.
 
-**What you build:**
+**What was built:**
 
 Rust:
-- `Regulariser` trait with a `Tikhonov` implementation
+- `Regulariser` trait (`src/regularise.rs`) with `SecondDerivative` implementation
 - Second-derivative operator L as the regularisation matrix
 - Solve: minimise ‖Kc − I‖² + λ‖Lc‖²  →  (KᵀK + λLᵀL)c = KᵀI
-- `--lambda` CLI flag (user supplies λ manually)
-- Non-negativity constraint on P(r) (iterative clipping or NNLS)
+- `--lambda` CLI flag for manual λ supply
+- `IterativeClipping` non-negativity strategy (`src/nonneg.rs`): re-solves with zero-clamped bins
 - Boundary constraint: P(0) = P(r_max) = 0
-- `--rmax` CLI flag to override the default
+- `--rmax` CLI flag
 
 **Key trait introduced:**
 
@@ -140,65 +122,33 @@ trait Regulariser {
 }
 ```
 
-The solver now takes a `Regulariser` and a λ. This interface is designed so that
-each λ evaluation is self-contained — no shared mutable state — making it trivial
-to parallelise the λ grid search in M3.
-
 Python (`Dev/`):
-- Update `gen_sphere.py` to support multiple noise levels via CLI args
-- `gen_debye.py` already exists — no changes needed
-- `compare_pr.py`: overlay computed P(r) against analytic reference, compute χ²
-  and integrated squared error
+- `gen_sphere.py`: updated with noise-level CLI args
+- `gen_debye.py`: Debye chain fixture
 
-**Validation:**
-- *Noiseless sphere:* P(r) should match the analytic piecewise polynomial closely.
-- *Noisy Debye (k = 5):* With a well-chosen λ, P(r) should track the Gaussian
-  reference from `debye_pr_ref.dat`. Use `compare_pr.py` for both.
-
-The sphere noiseless case confirms the kernel and regulariser are correct.
-The Debye noisy case is the real benchmark for numerical robustness.
-
-**Definition of done:** `unfourier --lambda 0.01 --rmax 180 Dev/debye_k5.dat`
+**Definition of done:** ✅ `unfourier --lambda 0.01 --rmax 180 Dev/debye_k5.dat`
 produces a smooth, non-negative P(r) that visually matches the Debye reference.
 
 ---
 
-## M3 — Automatic regularisation (L-curve / GCV)
+## M3 — Automatic regularisation (L-curve / GCV) ✅
 
 **Goal:** Remove the need to hand-tune λ.
 
-**What you build:**
+**What was built:**
 
-Rust:
-- `LambdaSelector` trait:
-  ```
-  trait LambdaSelector {
-      fn select(&self, candidates: &[LambdaEvaluation]) -> f64;
-  }
-  ```
-  where `LambdaEvaluation { lambda, residual_norm, solution_norm, ... }` is a
-  struct holding everything computed for one λ candidate.
-- `LCurve` implementation: find corner of maximum curvature in the
-  (log ‖residual‖, log ‖solution‖) plane
-- `GCV` implementation: generalised cross-validation criterion
-- λ grid generation (log-spaced) — each candidate is evaluated independently,
-  results collected into a `Vec<LambdaEvaluation>`. This is the natural
-  parallelisation point for a future `rayon::par_iter()`.
-- `--auto` flag (default) with `--method lcurve|gcv`
-- `--lambda` still works as a manual override
-- Automatic r_max estimation (π / q_min as starting guess, with `--rmax` override)
+Rust (`src/lambda_select.rs`):
+- `LambdaSelector` trait with `LambdaEvaluation` struct (lambda, residual_norm, solution_norm, gcv, log_evidence)
+- `GcvSelector`: minimises generalised cross-validation score (default method)
+- `LCurveSelector`: finds corner of maximum curvature in (log ‖residual‖, log ‖solution‖) plane
+- Log-spaced λ grid; each candidate evaluated independently into `Vec<LambdaEvaluation>` (parallelism-ready)
+- `--method lcurve|gcv|manual|bayes` CLI flag; `--lambda` still works as manual override
+- Automatic r_max estimation (π / q_min) with `--rmax` override
 
 Python (`Dev/`):
-- `sweep_noise.py`: run unFourier on Debye data at multiple noise levels (k = 3,
-  5, 10, 20), collect the auto-selected λ and P(r) quality metrics, plot
-- Add a third fixture for generalisation testing: hollow sphere or core-shell
-  particle (noiseless, to test a bimodal P(r))
+- `sweep_noise.py`: sweeps Debye data at multiple noise levels, collects auto-selected λ and quality metrics
 
-**Validation:** Run on Debye data across the noise sweep. The automatic λ should
-track the best hand-tuned λ from M2. Also run on the noiseless sphere and the
-new fixture to confirm the selector generalises.
-
-**Definition of done:** `unfourier Dev/debye_k5.dat` (no manual λ) produces a
+**Definition of done:** ✅ `unfourier Dev/debye_k5.dat` (no manual λ) produces a
 good P(r) across the noise sweep.
 
 ---

@@ -1,4 +1,5 @@
 pub mod basis;
+pub mod bspline;
 pub mod data;
 pub mod kernel;
 pub mod lambda_select;
