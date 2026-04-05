@@ -3,7 +3,7 @@ use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 
 use unfourier::{
-    basis::{BasisSet, UniformGrid},
+    basis::{BasisSet, CubicBSpline, UniformGrid},
     data::parse_dat,
     kernel::build_weighted_system,
     lambda_select::{
@@ -18,6 +18,16 @@ use unfourier::{
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
+
+/// Which basis to use for representing P(r).
+#[derive(Debug, Clone, ValueEnum, Default)]
+enum BasisChoice {
+    /// Piecewise-constant rectangular bins (default, matches M1–M4 behaviour).
+    #[default]
+    Rect,
+    /// Cubic B-spline basis with zero boundary conditions (M5).
+    Spline,
+}
 
 /// How to choose the regularisation strength λ.
 #[derive(Debug, Clone, ValueEnum)]
@@ -64,7 +74,20 @@ struct Args {
     #[arg(long)]
     rmax: Option<f64>,
 
-    /// Number of r grid points.
+    /// Basis set for representing P(r).
+    /// 'rect'   — piecewise-constant rectangular bins (default).
+    /// 'spline' — cubic B-splines with zero boundary conditions (M5).
+    #[arg(long, value_enum, default_value_t = BasisChoice::Rect)]
+    basis: BasisChoice,
+
+    /// Number of free basis parameters.
+    /// For 'rect'   defaults to --npoints (100).
+    /// For 'spline' defaults to 20.
+    /// Overrides --npoints when provided.
+    #[arg(long)]
+    n_basis: Option<usize>,
+
+    /// Number of r grid points (rectangular basis only; superseded by --n-basis).
     #[arg(long, default_value_t = 100)]
     npoints: usize,
 
@@ -147,17 +170,31 @@ fn main() -> Result<()> {
         eprintln!("  r_max = {:.2} Å  (user-specified)", r_max);
     }
 
-    let basis = UniformGrid::new(r_max, args.npoints);
-    if args.verbose {
-        eprintln!(
-            "  r grid: {} points, Δr = {:.4} Å",
-            args.npoints,
-            basis.delta_r()
-        );
-    }
+    let basis: Box<dyn BasisSet> = match args.basis {
+        BasisChoice::Rect => {
+            let n = args.n_basis.unwrap_or(args.npoints);
+            let b = UniformGrid::new(r_max, n);
+            if args.verbose {
+                eprintln!(
+                    "  basis: rect  n={} bins  Δr={:.4} Å",
+                    n,
+                    b.delta_r()
+                );
+            }
+            Box::new(b)
+        }
+        BasisChoice::Spline => {
+            let n = args.n_basis.unwrap_or(20);
+            let b = CubicBSpline::new(r_max, n);
+            if args.verbose {
+                eprintln!("  basis: spline  n_basis={}", n);
+            }
+            Box::new(b)
+        }
+    };
 
     // ---- 4. Weighted system ---------------------------------------------
-    let (k_weighted, i_weighted) = build_weighted_system(&basis, &data);
+    let (k_weighted, i_weighted) = build_weighted_system(basis.as_ref(), &data);
     let k_unweighted = basis.build_kernel_matrix(&data.q);
 
     // ---- 5. Solve --------------------------------------------------------

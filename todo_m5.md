@@ -40,83 +40,83 @@ post-hoc clamping needed. The free parameters are `c_1 .. c_{n-2}`.
 
 File: `Dev/spline_pr_tests.py`
 
-- [ ] Replace the `CubicSpline` interpolating approach with a proper B-spline design
+- [x] Replace the `CubicSpline` interpolating approach with a proper B-spline design
       matrix using `scipy.interpolate.BSpline` and `make_interp_spline` / manual knot
       construction via `splev`/`BSpline.design_matrix`.
-- [ ] Implement `make_bspline_basis(r_max, n_interior_knots, degree=3)` that returns:
+- [x] Implement `make_bspline_basis(r_max, n_interior_knots, degree=3)` that returns:
   - the clamped knot vector
   - the design matrix `B` of shape `(n_r_eval, n_free)` excluding the two endpoint
     columns (n_free = n_total - 2)
   - Greville abscissae for the free basis functions
-- [ ] Verify P(0) = 0 and P(r_max) = 0 for arbitrary coefficient vectors by
+- [x] Verify P(0) = 0 and P(r_max) = 0 for arbitrary coefficient vectors by
       evaluating `B @ c` at r=0 and r=r_max.
-- [ ] Compute the kernel matrix `K[i,j] = 4π ∫ B_j(r) sin(q_i r)/(q_i r) dr`
+- [x] Compute the kernel matrix `K[i,j] = 4π ∫ B_j(r) sin(q_i r)/(q_i r) dr`
       numerically (Gauss-Legendre over each knot span) and compare to the rectangular
       basis kernel on the same q grid.
-- [ ] Recover P(r) on clean Debye data using `scipy.optimize.nnls` with the B-spline
+- [x] Recover P(r) on clean Debye data using `scipy.optimize.nnls` with the B-spline
       K matrix. Confirm the result is at least as good as the rectangular basis with
       the same number of free parameters.
-- [ ] Add a convergence check: increase n_interior_knots from 10 → 50 and plot
+- [x] Add a convergence check: increase n_interior_knots from 10 → 50 and plot
       residual and P(r) quality vs knot count.
 
 ### 2 — Rust: Cox–de Boor B-spline evaluation
 
 File: new `src/bspline.rs` (internal utility, not pub in the trait hierarchy)
 
-- [ ] Implement `fn clamped_knots(r_max: f64, n_interior: usize) -> Vec<f64>` that
+- [x] Implement `fn clamped_knots(r_max: f64, n_interior: usize) -> Vec<f64>` that
       produces `[0,0,0,0, t_1,...,t_n_interior, r_max,r_max,r_max,r_max]` with
       uniformly spaced interior knots.
-- [ ] Implement `fn basis_matrix(knots: &[f64], degree: usize, r: &[f64]) -> DMatrix<f64>`
+- [x] Implement `fn basis_matrix(knots: &[f64], degree: usize, r: &[f64]) -> DMatrix<f64>`
       using the Cox–de Boor recursion. Returns the full `(n_r, n_basis)` matrix
       including all basis functions (including the two endpoint ones).
-- [ ] Implement `fn greville(knots: &[f64], degree: usize) -> Vec<f64>` returning the
+- [x] Implement `fn greville(knots: &[f64], degree: usize) -> Vec<f64>` returning the
       Greville abscissae `ξ_j = (t_{j+1} + ... + t_{j+degree}) / degree`.
-- [ ] Unit test: on a 5-knot-span clamped grid, verify that the basis functions sum
+- [x] Unit test: on a 5-knot-span clamped grid, verify that the basis functions sum
       to 1 at every interior point (partition of unity).
-- [ ] Unit test: verify `B[0, 0] == 1.0` and `B[0, 1..] == 0`, and similarly at
+- [x] Unit test: verify `B[0, 0] == 1.0` and `B[0, 1..] == 0`, and similarly at
       `r = r_max` for the last column.
 
 ### 3 — Rust: kernel integral via Gauss–Legendre quadrature
 
 File: `src/bspline.rs` or `src/kernel.rs`
 
-- [ ] Implement 5-point Gauss–Legendre quadrature nodes and weights as a `const`
+- [x] Implement 5-point Gauss–Legendre quadrature nodes and weights as a `const`
       array (or compute once at startup).
-- [ ] Implement `fn integrate_basis_sinc(knots: &[f64], j: usize, q: f64) -> f64`
+- [x] Implement `fn integrate_basis_sinc(knots: &[f64], j: usize, q: f64) -> f64`
       that integrates `B_j(r) · sinc(q·r)` over the support `[t_j, t_{j+4}]` by
       summing Gauss–Legendre over each of the (up to 4) knot spans.
   - Handle the `q → 0` limit: `sinc(0) = 1`, so the integral becomes
     `∫ B_j(r) dr`, which can also be computed by the same quadrature.
-- [ ] Verify the quadrature against the Python kernel matrix (same knots, same q
+- [x] Verify the quadrature against the Python kernel matrix (same knots, same q
       values — values should match to < 1e-6 relative error).
 
 ### 4 — Rust: `CubicBSpline` struct implementing `BasisSet`
 
 File: `src/basis.rs`
 
-- [ ] Add `pub struct CubicBSpline { knots: Vec<f64>, r_free: Vec<f64>, r_max: f64 }`
+- [x] Add `pub struct CubicBSpline { knots: Vec<f64>, r_free: Vec<f64>, r_max: f64 }`
       where `r_free` holds the Greville abscissae of the **free** basis functions
       (indices 1..n-2).
-- [ ] `CubicBSpline::new(r_max: f64, n_basis: usize) -> Self` — `n_basis` is the
+- [x] `CubicBSpline::new(r_max: f64, n_basis: usize) -> Self` — `n_basis` is the
       number of free parameters (= n_interior_knots + 2). Suggest a default of 20.
-- [ ] Implement `BasisSet`:
+- [x] Implement `BasisSet`:
   - `r_values()` → Greville abscissae of the free basis functions
   - `r_max()` → r_max
   - `build_kernel_matrix(q)` → `(n_q × n_basis)` matrix using the quadrature
     integral, one column per free basis function (columns 1..n-2 of the full basis)
-- [ ] The existing `SecondDerivative` regulariser works unchanged on the control
+- [x] The existing `SecondDerivative` regulariser works unchanged on the control
       points of the free basis functions — no modifications needed.
 
 ### 5 — Rust: CLI integration
 
 File: `src/main.rs`
 
-- [ ] Add `--basis rect|spline` flag (default: `rect` to preserve existing behaviour).
-- [ ] Add `--n-basis N` flag (default: 20 for spline, existing n_points logic for
+- [x] Add `--basis rect|spline` flag (default: `rect` to preserve existing behaviour).
+- [x] Add `--n-basis N` flag (default: 20 for spline, existing n_points logic for
       rect). The flag name `--n-basis` is more general than `--n-points`.
-- [ ] Wire the flag into the pipeline: construct either `UniformGrid` or `CubicBSpline`
+- [x] Wire the flag into the pipeline: construct either `UniformGrid` or `CubicBSpline`
       and pass as `&dyn BasisSet`. No other pipeline changes needed.
-- [ ] Verbose output (`--verbose`): print basis type and n_basis alongside the
+- [x] Verbose output (`--verbose`): print basis type and n_basis alongside the
       existing λ and r_max diagnostics.
 
 ### 6 — Validation

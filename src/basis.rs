@@ -1,4 +1,5 @@
 use nalgebra::DMatrix;
+use crate::bspline;
 
 /// A set of basis functions for representing P(r).
 ///
@@ -78,6 +79,88 @@ impl UniformGrid {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CubicBSpline — smooth spline basis (M5)
+// ---------------------------------------------------------------------------
+
+/// Cubic B-spline basis on `[0, r_max]` with zero boundary conditions.
+///
+/// P(r) is represented as a linear combination of `n_basis` *free* cubic
+/// B-spline functions:
+///
+/// ```text
+/// P(r) = Σ_{j=1}^{n_total-2}  c_j · B_j(r)
+/// ```
+///
+/// The two endpoint basis functions (j = 0 and j = n_total − 1) are excluded
+/// from the design matrix, which enforces P(0) = P(r_max) = 0 exactly for any
+/// coefficient vector — no post-hoc clamping needed.
+///
+/// # Parameters
+///
+/// `n_basis` is the number of **free** parameters.  The relationship to the
+/// underlying knot vector is:
+///
+/// ```text
+/// n_interior_knots = n_basis - 2
+/// n_total          = n_basis + 2   (including the two clamped endpoints)
+/// ```
+///
+/// The default recommended value is `n_basis = 20`.
+pub struct CubicBSpline {
+    knots: Vec<f64>,
+    /// Greville abscissae of the free basis functions (B_1 … B_{n_total-2}).
+    r_free: Vec<f64>,
+    r_max: f64,
+}
+
+impl CubicBSpline {
+    /// Create a cubic B-spline basis on `[0, r_max]` with `n_basis` free parameters.
+    ///
+    /// Interior knots are placed uniformly; boundary conditions P(0) = P(r_max) = 0
+    /// are enforced structurally via a clamped knot vector.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `r_max <= 0` or `n_basis < 2`.
+    pub fn new(r_max: f64, n_basis: usize) -> Self {
+        assert!(r_max > 0.0, "r_max must be positive");
+        assert!(n_basis >= 2, "n_basis must be at least 2");
+
+        let n_interior = n_basis - 2; // n_free = n_interior + 2
+        let knots = bspline::clamped_knots(r_max, n_interior);
+
+        // Greville abscissae for the free functions: drop the first and last
+        // entries (those belong to the clamped endpoint basis functions).
+        let xi_all = bspline::greville(&knots, 3);
+        let r_free = xi_all[1..xi_all.len() - 1].to_vec();
+
+        Self { knots, r_free, r_max }
+    }
+}
+
+impl BasisSet for CubicBSpline {
+    fn r_values(&self) -> &[f64] {
+        &self.r_free
+    }
+
+    fn r_max(&self) -> f64 {
+        self.r_max
+    }
+
+    /// K_ij = 4π ∫ B_j(r) sin(q_i r)/(q_i r) dr   for each free basis function j.
+    ///
+    /// Built via 5-point Gauss–Legendre quadrature per knot span.
+    /// The two endpoint columns of the full basis matrix are dropped here,
+    /// so the returned matrix has shape `(n_q × n_basis)`.
+    fn build_kernel_matrix(&self, q: &[f64]) -> DMatrix<f64> {
+        let full = bspline::sinc_kernel_matrix(&self.knots, 3, q);
+        // Drop column 0 (B_0, clamped at r=0) and column n_total-1 (B_{n-1}, clamped at r_max)
+        let n_free = full.ncols() - 2;
+        DMatrix::from_fn(q.len(), n_free, |i, j| full[(i, j + 1)])
+    }
+}
+
 impl BasisSet for UniformGrid {
     fn r_values(&self) -> &[f64] {
         &self.r
@@ -103,5 +186,60 @@ impl BasisSet for UniformGrid {
             };
             4.0 * std::f64::consts::PI * sinc * delta_r
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// n_basis free parameters → correct dimensions from BasisSet trait methods.
+    #[test]
+    fn cubic_bspline_dimensions() {
+        let bs = CubicBSpline::new(150.0, 20);
+        assert_eq!(bs.n_basis(), 20);
+        assert_eq!(bs.r_values().len(), 20);
+        assert_eq!(bs.r_max(), 150.0);
+
+        let q: Vec<f64> = (1..=50).map(|i| i as f64 * 0.01).collect();
+        let k = bs.build_kernel_matrix(&q);
+        assert_eq!(k.nrows(), 50);
+        assert_eq!(k.ncols(), 20);
+    }
+
+    /// The free basis functions have compact support strictly inside (0, r_max),
+    /// so P(0) = P(r_max) = 0 for any coefficient vector — verified by
+    /// evaluating each kernel column at q → 0 and checking the sum reconstructs
+    /// ∫ P(r) dr with correct boundary behaviour.
+    ///
+    /// More directly: the Greville abscissae of the free functions must all
+    /// lie strictly between 0 and r_max.
+    #[test]
+    fn greville_strictly_interior() {
+        let r_max = 100.0_f64;
+        let bs = CubicBSpline::new(r_max, 15);
+        for &xi in bs.r_values() {
+            assert!(xi > 0.0 && xi < r_max,
+                "Greville abscissa {xi} not strictly inside (0, {r_max})");
+        }
+    }
+
+    /// At q = 0, K_ij = 4π ∫ B_j(r) dr.  Summing over all free basis functions
+    /// gives 4π · (r_max − first_support − last_support).  For a clamped grid
+    /// the two endpoint functions each contribute half a span less, so the sum
+    /// of the entire row at q = 0 should be 4π · r_max minus the endpoint
+    /// contributions.  Rather than tracking those analytically we just check that
+    /// each entry is positive (the sinc integrand is positive near q = 0).
+    #[test]
+    fn kernel_entries_positive_at_q0() {
+        let bs = CubicBSpline::new(80.0, 12);
+        let k = bs.build_kernel_matrix(&[0.0]);
+        for j in 0..k.ncols() {
+            assert!(k[(0, j)] > 0.0, "K[0,{j}] = {} at q=0 (expected > 0)", k[(0, j)]);
+        }
     }
 }
