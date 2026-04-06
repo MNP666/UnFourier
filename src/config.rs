@@ -27,6 +27,15 @@ pub struct BasisConfig {
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
+pub struct ConstraintsConfig {
+    /// -1 = disabled, 0 = auto default weight, >0 = explicit multiplier on default
+    pub boundary_weight: Option<f64>,
+    /// -1 = disabled, 0 = default relative weight 1.0, >0 = explicit relative weight
+    pub d1_smoothness: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct UnfourierConfig {
     #[serde(default)]
     pub regularisation: RegularisationConfig,
@@ -34,6 +43,8 @@ pub struct UnfourierConfig {
     pub preprocessing: PreprocessingConfig,
     #[serde(default)]
     pub basis: BasisConfig,
+    #[serde(default)]
+    pub constraints: ConstraintsConfig,
 }
 
 impl UnfourierConfig {
@@ -103,5 +114,30 @@ npoints = 30
         let cfg: UnfourierConfig = toml::from_str("").unwrap();
         assert!(cfg.regularisation.lambda_min.is_none());
         assert!(cfg.preprocessing.qmax.is_none());
+    }
+
+    #[test]
+    fn parse_constraints_toml() {
+        let text = r#"
+[constraints]
+boundary_weight = 0.0
+d1_smoothness = -1.0
+"#;
+        let cfg: UnfourierConfig = toml::from_str(text).unwrap();
+        assert_eq!(cfg.constraints.boundary_weight, Some(0.0));
+        assert_eq!(cfg.constraints.d1_smoothness, Some(-1.0));
+
+        // Explicit multiplier
+        let text2 = r#"
+[constraints]
+boundary_weight = 2.5
+"#;
+        let cfg2: UnfourierConfig = toml::from_str(text2).unwrap();
+        assert_eq!(cfg2.constraints.boundary_weight, Some(2.5));
+        assert!(cfg2.constraints.d1_smoothness.is_none());
+
+        // Absent section → all None
+        let cfg3: UnfourierConfig = toml::from_str("").unwrap();
+        assert!(cfg3.constraints.boundary_weight.is_none());
     }
 }

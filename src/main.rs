@@ -7,13 +7,14 @@ use std::path::PathBuf;
 use unfourier::{
     basis::{BasisSet, CubicBSpline, UniformGrid},
     data::{parse_dat, SaxsData},
-    kernel::build_weighted_system,
+    kernel::{append_boundary_constraints, build_weighted_system},
     lambda_select::{
         estimate_lambda_range, evaluate_lambda_grid, log_lambda_grid, posterior_sigma,
         BayesianEvidence, GcvSelector, GridMatrices, LCurveSelector, LambdaSelector,
     },
     output::{print_summary, write_fit_to_file, write_pr_to_file, write_pr_to_stdout},
     preprocess::{ClipNegative, LogRebin, OmitNonPositive, Preprocessor, QRangeSelector},
+    regularise::{CombinedDerivative, Regulariser, SecondDerivative},
     solver::{Solution, Solver, TikhonovSolver},
 };
 
@@ -174,9 +175,22 @@ fn run_solve(
     method: &Method,
     args: &Args,
     verbose: bool,
+    boundary_w: Option<f64>,
+    ltl: nalgebra::DMatrix<f64>,
+    reg: Box<dyn Regulariser>,
 ) -> Result<Solution> {
-    let (k_weighted, i_weighted) = build_weighted_system(basis, data);
+    let (mut k_weighted, mut i_weighted) = build_weighted_system(basis, data);
     let k_unweighted = basis.build_kernel_matrix(&data.q);
+
+    if let Some(w) = boundary_w {
+        append_boundary_constraints(&mut k_weighted, &mut i_weighted, w);
+        if verbose {
+            eprintln!(
+                "  [constraints] boundary P(0)=P(Dmax)=0  weight = {:.3e}",
+                w
+            );
+        }
+    }
 
     match method {
         Method::Manual => {
@@ -184,7 +198,8 @@ fn run_solve(
             if verbose {
                 eprintln!("  method: manual  λ = {:.3e}", lambda);
             }
-            let solver = TikhonovSolver::new(lambda);
+            let mut solver = TikhonovSolver::new(lambda);
+            solver.regulariser = reg;
             solver.solve(
                 &k_weighted,
                 &i_weighted,
@@ -203,6 +218,7 @@ fn run_solve(
                 &data.intensity,
                 &data.error,
                 basis.r_values(),
+                ltl,
             );
 
             let (default_min, default_max) = estimate_lambda_range(&matrices);
@@ -271,6 +287,15 @@ fn main() -> Result<()> {
     let mut args = Args::parse();
 
     // ---- 0. Load optional TOML config and fill unset CLI args ---------------
+    // boundary_multiplier: None = disabled, Some(m) where m is the user-supplied
+    // multiplier (0.0 means "use default weight ×1"; positive means "×m").
+    let mut boundary_multiplier: Option<f64> = None;
+
+    // d1_weight: effective relative weight for the first-derivative penalty.
+    // None / -1 = SecondDerivative only (default). 0.0 = 1.0. positive = explicit.
+    let mut d1_weight: f64 = 0.0;
+    let mut use_d1 = false;
+
     if let Some(cfg) = config::UnfourierConfig::load()? {
         if args.verbose {
             eprintln!("  [config] loaded from unfourier.toml");
@@ -338,6 +363,28 @@ fn main() -> Result<()> {
                     eprintln!("  [config]   n_basis = {}", n);
                 }
             }
+        }
+
+        // [constraints]
+        if let Some(bw) = cfg.constraints.boundary_weight {
+            if bw >= 0.0 {
+                // 0.0 → multiplier 1.0 (auto); positive → explicit multiplier
+                boundary_multiplier = Some(if bw == 0.0 { 1.0 } else { bw });
+                if args.verbose {
+                    eprintln!("  [config]   boundary_weight = {}", bw);
+                }
+            }
+            // bw < 0 (i.e. -1) → disabled; boundary_multiplier stays None
+        }
+        if let Some(d1) = cfg.constraints.d1_smoothness {
+            if d1 >= 0.0 {
+                use_d1 = true;
+                d1_weight = if d1 == 0.0 { 1.0 } else { d1 };
+                if args.verbose {
+                    eprintln!("  [config]   d1_smoothness = {}", d1);
+                }
+            }
+            // d1 < 0 (i.e. -1) → disabled; use_d1 stays false
         }
     }
 
@@ -474,7 +521,67 @@ fn main() -> Result<()> {
     };
 
     // ---- 4 + 5. Build system and solve -----------------------------------
-    let solution = run_solve(&data, basis.as_ref(), &method, &args, args.verbose)?;
+
+    // Compute boundary constraint weight for rect basis.
+    // w_default = sqrt(N) × rms(1/σ); multiplier scales it.
+    let boundary_w: Option<f64> = if matches!(args.basis, BasisChoice::Rect) {
+        boundary_multiplier.map(|m| {
+            let rms_inv_sigma = (data
+                .error
+                .iter()
+                .map(|s| 1.0 / s / s)
+                .sum::<f64>()
+                / data.error.len() as f64)
+                .sqrt();
+            (data.len() as f64).sqrt() * rms_inv_sigma * m
+        })
+    } else {
+        None
+    };
+
+    // Build the regulariser (and its Gram matrix) once.
+    let n_basis = basis.r_values().len();
+    let reg: Box<dyn Regulariser> = if use_d1 {
+        if args.verbose {
+            eprintln!(
+                "  [constraints] regulariser: combined  d1={:.2}  d2=1.00",
+                d1_weight
+            );
+        }
+        Box::new(CombinedDerivative { d1_weight, d2_weight: 1.0 })
+    } else {
+        Box::new(SecondDerivative)
+    };
+    let ltl = reg.gram_matrix(n_basis);
+
+    let mut solution = run_solve(
+        &data,
+        basis.as_ref(),
+        &method,
+        &args,
+        args.verbose,
+        boundary_w,
+        ltl,
+        reg,
+    )?;
+
+    // For the spline basis the polynomial is structurally zero at r=0 and
+    // r=r_max (the endpoint basis functions are excluded from the design
+    // matrix), but r_values() only contains interior Greville abscissae so
+    // the output never shows those boundary values explicitly.  Add them so
+    // that the output curve visibly reaches zero at both ends.
+    if matches!(args.basis, BasisChoice::Spline) {
+        solution.r.insert(0, 0.0);
+        solution.p_r.insert(0, 0.0);
+        if let Some(ref mut err) = solution.p_r_err {
+            err.insert(0, 0.0);
+        }
+        solution.r.push(r_max);
+        solution.p_r.push(0.0);
+        if let Some(ref mut err) = solution.p_r_err {
+            err.push(0.0);
+        }
+    }
 
     if args.verbose {
         if let Some(lam_eff) = solution.lambda_effective {

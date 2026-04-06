@@ -6,6 +6,7 @@ For each of the three real SAXS datasets, this script:
   2. Runs unfourier (rect and spline bases) and captures P(r).
   3. For SASDYU3 (1696 pts) also runs with --rebin 200 and reports runtime.
   4. Computes ISE (integrated squared error, peak-normalised) and Rg agreement.
+  5. Saves a 3×3 validation plot (validation_plot.png).
 
 Pass criteria (per todo_m6.md):
   - ISE < 0.15
@@ -17,13 +18,16 @@ Usage:
 
 from __future__ import annotations
 
-import io
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
+from scipy.interpolate import BSpline
 
 # Make parse_gnom importable regardless of cwd.
 sys.path.insert(0, str(Path(__file__).parent))
@@ -37,14 +41,21 @@ REPO = Path(__file__).parent.parent
 BIN = REPO / "target" / "release" / "unfourier"
 DAT_DIR = REPO / "data" / "dat_ref"
 REF_DIR = REPO / "data" / "prs_ref"
+PLOT_OUT = Path(__file__).parent / "validation_plot.png"
 
 DATASETS = ["SASDME2", "SASDF42", "SASDYU3"]
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Basis visualisation constants (must match unfourier defaults)
 # ---------------------------------------------------------------------------
 
-_FLOAT = r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?"
+NPOINTS_RECT = 100   # --npoints default
+NBASIS_SPLINE = 20   # --n-basis default for spline
+DEGREE_SPLINE = 3
+
+# ---------------------------------------------------------------------------
+# Helpers — validation
+# ---------------------------------------------------------------------------
 
 
 def run_unfourier(
@@ -130,6 +141,160 @@ def fmt_pass(value: float, threshold: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Helpers — basis function visualisation
+# ---------------------------------------------------------------------------
+
+def _spline_knots(r_max: float, n_basis: int = NBASIS_SPLINE) -> np.ndarray:
+    """Clamped cubic B-spline knot vector — mirrors Rust CubicBSpline::new()."""
+    n_interior = n_basis - 2
+    t_int = [r_max * i / (n_interior + 1) for i in range(1, n_interior + 1)]
+    return np.array([0.0] * (DEGREE_SPLINE + 1) + t_int + [r_max] * (DEGREE_SPLINE + 1))
+
+
+def _eval_bspline_j(knots: np.ndarray, j: int, r_vals: np.ndarray) -> np.ndarray:
+    """Evaluate the j-th B-spline (0-indexed over full knot-vector set)."""
+    n_total = len(knots) - DEGREE_SPLINE - 1
+    c = np.zeros(n_total)
+    c[j] = 1.0
+    vals = BSpline(knots, c, DEGREE_SPLINE, extrapolate=False)(r_vals)
+    return np.where(np.isfinite(vals), vals, 0.0)
+
+
+def _spline_greville(knots: np.ndarray, n_basis: int = NBASIS_SPLINE) -> np.ndarray:
+    """Greville abscissae for the free basis functions (indices 1..n_basis)."""
+    return np.array([
+        np.mean(knots[j + 1: j + DEGREE_SPLINE + 1])
+        for j in range(1, n_basis + 1)
+    ])
+
+
+# ---------------------------------------------------------------------------
+# Plot
+# ---------------------------------------------------------------------------
+
+def make_validation_plot(
+    plot_results: dict,
+    plot_refs: dict,
+    out_path: Path,
+) -> None:
+    """
+    3×3 figure:
+      col  → dataset (SASDME2 / SASDF42 / SASDYU3)
+      row0 → P(r) comparison: GNOM ref, rect, spline (all peak-normalised)
+      row1 → Rect basis: bar chart where each bar is one weighted top-hat
+      row2 → Spline basis: B-spline functions + interior knots + Greville pts
+    """
+    fig, axes = plt.subplots(3, 3, figsize=(18, 13))
+    fig.suptitle(
+        "unFourier validation — P(r) vs GNOM reference",
+        fontsize=13, fontweight="bold", y=1.001,
+    )
+
+    row_ylabels = [
+        "P(r) [peak-norm.]\ncomparison",
+        "P(r) [peak-norm.]\nrect basis functions",
+        "P(r) [peak-norm.]\nspline basis functions",
+    ]
+    for row, label in enumerate(row_ylabels):
+        axes[row, 0].set_ylabel(label, fontsize=8)
+
+    for col, name in enumerate(DATASETS):
+        ref = plot_refs[name]
+        d_max: float = ref["d_max"]
+        r_ref: np.ndarray = ref["r"]
+        pr_ref_n: np.ndarray = ref["pr"] / ref["pr"].max()
+
+        rect_arr: np.ndarray | None = plot_results[name].get("rect")
+        spline_arr: np.ndarray | None = plot_results[name].get("spline")
+
+        # ------------------------------------------------------------------ #
+        # Row 0 — P(r) comparison                                             #
+        # ------------------------------------------------------------------ #
+        ax = axes[0, col]
+        ax.plot(r_ref, pr_ref_n, "k-", lw=2, label="GNOM ref", zorder=3)
+        if rect_arr is not None and rect_arr[:, 1].max() > 0:
+            r, p = rect_arr[:, 0], rect_arr[:, 1]
+            ax.plot(r, p / p.max(), color="C0", lw=1.5, label="rect", zorder=2)
+        if spline_arr is not None and spline_arr[:, 1].max() > 0:
+            r, p = spline_arr[:, 0], spline_arr[:, 1]
+            ax.plot(r, p / p.max(), color="C1", lw=1.5, label="spline", zorder=2)
+        ax.set_title(name, fontsize=11, fontweight="bold")
+        ax.legend(fontsize=7, loc="upper right")
+        ax.set_xlim(0, d_max * 1.05)
+        ax.set_ylim(-0.08, 1.25)
+        ax.axhline(0, color="k", lw=0.5)
+
+        # ------------------------------------------------------------------ #
+        # Row 1 — Rect: each bar is one weighted top-hat basis function        #
+        # ------------------------------------------------------------------ #
+        ax = axes[1, col]
+        if rect_arr is not None and rect_arr[:, 1].max() > 0:
+            r, p = rect_arr[:, 0], rect_arr[:, 1]
+            n_pts = len(r)
+            dr = d_max / n_pts
+            p_n = p / p.max()
+            cmap_r = plt.cm.viridis
+            bar_colors = [cmap_r(j / max(n_pts - 1, 1)) for j in range(n_pts)]
+            ax.bar(r, p_n, width=dr, color=bar_colors, edgecolor="none", align="center")
+        else:
+            ax.text(0.5, 0.5, "run failed", transform=ax.transAxes,
+                    ha="center", va="center", color="red", fontsize=9)
+        ax.set_xlim(0, d_max * 1.05)
+        ax.set_ylim(-0.08, 1.25)
+        ax.axhline(0, color="k", lw=0.5)
+
+        # ------------------------------------------------------------------ #
+        # Row 2 — Spline: B-splines, interior knots, Greville pts, P(r)       #
+        # ------------------------------------------------------------------ #
+        ax = axes[2, col]
+        if spline_arr is not None and spline_arr[:, 1].max() > 0:
+            r, p = spline_arr[:, 0], spline_arr[:, 1]
+            p_n = p / p.max()
+
+            knots = _spline_knots(d_max)
+            # Interior knots are those between the clamped boundary repetitions
+            interior_knots = knots[DEGREE_SPLINE + 1: -(DEGREE_SPLINE + 1)]
+            greville = _spline_greville(knots)
+            r_dense = np.linspace(0, d_max, 600)
+
+            cmap_s = plt.cm.tab20
+            n_free = NBASIS_SPLINE
+            basis_scale = 0.35  # display basis fns at 35 % of plot height
+
+            # Free B-spline basis functions (indices 1..n_free in full set)
+            for k in range(n_free):
+                j = k + 1
+                b = _eval_bspline_j(knots, j, r_dense)
+                ax.plot(r_dense, b * basis_scale, color=cmap_s(k / n_free),
+                        lw=0.9, alpha=0.55)
+
+            # Interior knot positions
+            for kt in interior_knots:
+                ax.axvline(kt, color="#888888", lw=0.6, ls="--", alpha=0.55, zorder=1)
+
+            # Greville abscissae as downward triangles on the x-axis
+            ax.plot(greville, np.full_like(greville, -0.055), "kv", ms=4,
+                    zorder=5, clip_on=False, label="Greville pts")
+
+            # P(r) curve on top
+            ax.plot(r, p_n, color="#CC3311", lw=2, zorder=4, label="P(r)")
+            ax.legend(fontsize=7, loc="upper right")
+        else:
+            ax.text(0.5, 0.5, "run failed", transform=ax.transAxes,
+                    ha="center", va="center", color="red", fontsize=9)
+
+        ax.set_xlim(0, d_max * 1.05)
+        ax.set_ylim(-0.12, 1.25)
+        ax.axhline(0, color="k", lw=0.5)
+        ax.set_xlabel("r (Å)", fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\nValidation plot saved to: {out_path}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -142,10 +307,14 @@ def main() -> None:
     ISE_THRESHOLD = 0.15
     RG_REL_THRESHOLD = 0.15
 
-    # Per-dataset pass tracking (ISE criterion: at least 2/3 datasets must pass
-    # on rect basis, per todo_m6.md expected outcomes).
     dataset_ise_pass: dict[str, bool] = {}
     rg_all_pass = True
+
+    # Accumulators for the plot
+    plot_results: dict[str, dict[str, np.ndarray | None]] = {
+        name: {"rect": None, "spline": None} for name in DATASETS
+    }
+    plot_refs: dict[str, dict] = {}
 
     header_fields = [
         f"{'Dataset':<14}",
@@ -172,6 +341,8 @@ def main() -> None:
 
         r_ref = pr_ref_arr[:, 0]
         pr_ref = pr_ref_arr[:, 1]
+
+        plot_refs[name] = {"r": r_ref, "pr": pr_ref, "d_max": d_max}
 
         # Collect runs: (basis, rebin)
         runs: list[tuple[str, int]] = [("rect", 0), ("spline", 0)]
@@ -207,10 +378,11 @@ def main() -> None:
             ise_ok = ise < ISE_THRESHOLD
             rg_ok = rg_rel_err < RG_REL_THRESHOLD
 
-            # Track per-dataset ISE (use rect basis as the primary indicator).
-            # Rebin runs are diagnostic only — excluded from pass criteria.
             if basis == "rect" and rebin == 0:
                 dataset_ise_pass[name] = ise_ok
+                plot_results[name]["rect"] = pr_arr
+            if basis == "spline" and rebin == 0:
+                plot_results[name]["spline"] = pr_arr
             if rebin == 0 and not rg_ok:
                 rg_all_pass = False
 
@@ -229,7 +401,7 @@ def main() -> None:
 
     n_ise_pass = sum(dataset_ise_pass.values())
     n_datasets = len(DATASETS)
-    ise_criterion_ok = n_ise_pass >= 2  # at least 2/3 datasets must pass ISE
+    ise_criterion_ok = n_ise_pass >= 2
 
     print()
     print(f"Pass criteria: ISE < {ISE_THRESHOLD} for ≥2/{n_datasets} datasets  |  ΔRg/Rg < {RG_REL_THRESHOLD} for all")
@@ -240,6 +412,11 @@ def main() -> None:
         print("Overall: ALL CRITERIA MET")
     else:
         print("Overall: SOME CRITERIA NOT MET")
+
+    # Generate the 3×3 validation plot regardless of pass/fail outcome
+    make_validation_plot(plot_results, plot_refs, PLOT_OUT)
+
+    if not (ise_criterion_ok and rg_all_pass):
         sys.exit(1)
 
 

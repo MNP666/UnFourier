@@ -54,6 +54,33 @@ pub fn build_weighted_system(
     (k_weighted, i_weighted)
 }
 
+/// Append two soft equality constraint rows to the weighted system:
+///   [weight, 0, …, 0] · c ≈ 0   (forces first coefficient → 0, i.e. P(r=0) = 0)
+///   [0, …, 0, weight] · c ≈ 0   (forces last  coefficient → 0, i.e. P(r=D_max) = 0)
+///
+/// Both `k_w` and `i_w` grow by 2 rows/elements in-place.
+/// These rows flow through GCV/L-curve/Bayes unchanged — they look like
+/// two additional data points with target value zero.
+pub fn append_boundary_constraints(
+    k_w: &mut DMatrix<f64>,
+    i_w: &mut Vec<f64>,
+    weight: f64,
+) {
+    let n_rows = k_w.nrows();
+    let n_cols = k_w.ncols();
+
+    let mut new_k = DMatrix::zeros(n_rows + 2, n_cols);
+    new_k.rows_mut(0, n_rows).copy_from(k_w);
+    // Row n_rows: P(r=0)    → first coefficient = 0
+    new_k[(n_rows, 0)] = weight;
+    // Row n_rows+1: P(r=Dmax) → last coefficient = 0
+    new_k[(n_rows + 1, n_cols - 1)] = weight;
+
+    *k_w = new_k;
+    i_w.push(0.0);
+    i_w.push(0.0);
+}
+
 /// Back-calculate I(q) from a coefficient vector and the (unweighted) kernel.
 ///
 /// I_calc = K · c
@@ -62,4 +89,111 @@ pub fn back_calculate(basis: &dyn BasisSet, q: &[f64], coeffs: &[f64]) -> Vec<f6
     let c = nalgebra::DVector::from_column_slice(coeffs);
     let i_calc = k * c;
     i_calc.iter().cloned().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nalgebra::DMatrix;
+
+    #[test]
+    fn boundary_constraint_shape_and_values() {
+        // 3×2 matrix: 3 data points, 2 basis functions
+        let mut k = DMatrix::<f64>::from_row_slice(3, 2, &[
+            1.0, 2.0,
+            3.0, 4.0,
+            5.0, 6.0,
+        ]);
+        let mut i_w = vec![7.0, 8.0, 9.0];
+
+        append_boundary_constraints(&mut k, &mut i_w, 10.0);
+
+        // Shape grows to 5×2
+        assert_eq!(k.nrows(), 5);
+        assert_eq!(k.ncols(), 2);
+
+        // Original rows unchanged
+        assert_eq!(k[(0, 0)], 1.0);
+        assert_eq!(k[(2, 1)], 6.0);
+
+        // Constraint row for P(r=0): [weight, 0]
+        assert_eq!(k[(3, 0)], 10.0);
+        assert_eq!(k[(3, 1)], 0.0);
+
+        // Constraint row for P(r=D_max): [0, weight]
+        assert_eq!(k[(4, 0)], 0.0);
+        assert_eq!(k[(4, 1)], 10.0);
+
+        // i_w grows by 2 zeros
+        assert_eq!(i_w.len(), 5);
+        assert_eq!(i_w[3], 0.0);
+        assert_eq!(i_w[4], 0.0);
+    }
+
+    /// End-to-end: a 5-bin rect solve with a large boundary weight should
+    /// drive p_r[0] and p_r[4] to essentially zero, even when a flat
+    /// intensity signal would otherwise spread weight into the edge bins.
+    #[test]
+    fn large_boundary_weight_clamps_edge_bins() {
+        use crate::basis::{BasisSet, UniformGrid};
+        use crate::data::SaxsData;
+        use crate::solver::{Solver, TikhonovSolver};
+
+        // Build a 5-bin rect basis over [0, 5] Å.
+        let r_max = 5.0_f64;
+        let n_bins = 5_usize;
+        let basis = UniformGrid::new(r_max, n_bins);
+
+        // Synthetic q grid: 30 evenly-spaced q values from 0.05 to 0.5 Å⁻¹.
+        let n_q = 30_usize;
+        let q: Vec<f64> = (0..n_q)
+            .map(|i| 0.05 + i as f64 * (0.45 / (n_q - 1) as f64))
+            .collect();
+
+        // Forward-calculate a reference I(q) from a uniform P(r) = 1 for all bins.
+        // This is deliberately flat so the unconstrained solve would prefer to
+        // spread weight evenly, including into the edge bins.
+        let k_raw = basis.build_kernel_matrix(&q);
+        let c_flat = nalgebra::DVector::from_element(n_bins, 1.0_f64);
+        let i_ref = (k_raw.clone() * c_flat).iter().cloned().collect::<Vec<_>>();
+
+        // Uniform small errors (σ = 0.01).
+        let sigma = vec![0.01_f64; n_q];
+
+        let data = SaxsData { q, intensity: i_ref, error: sigma };
+
+        // Build weighted system and apply a large boundary weight.
+        // Use 1e3 × rms(1/σ) × sqrt(N) so the weight is large relative to
+        // the data but doesn't inflate trace(KᵀK) so much that λ_eff blows up.
+        let (mut kw, mut iw) = build_weighted_system(&basis, &data);
+        let rms_inv_sigma = (data.error.iter().map(|s| 1.0 / s / s).sum::<f64>()
+            / data.error.len() as f64)
+            .sqrt();
+        let w_large = 1e3 * (data.len() as f64).sqrt() * rms_inv_sigma;
+        append_boundary_constraints(&mut kw, &mut iw, w_large);
+
+        // Use a tiny λ so Tikhonov regularisation is weak relative to the
+        // boundary constraint.
+        let solver = TikhonovSolver::new(1e-6);
+        let sol = solver
+            .solve(&kw, &iw, &k_raw, &data.intensity, &data.error, basis.r_values())
+            .unwrap();
+
+        let peak = sol.p_r.iter().cloned().fold(0.0_f64, f64::max);
+        assert!(peak > 0.0, "solution is all-zero");
+
+        let threshold = 1e-3 * peak;
+        assert!(
+            sol.p_r[0] < threshold,
+            "p_r[0] = {:.3e} is not ≈ 0 (peak={:.3e})",
+            sol.p_r[0],
+            peak
+        );
+        assert!(
+            sol.p_r[n_bins - 1] < threshold,
+            "p_r[n-1] = {:.3e} is not ≈ 0 (peak={:.3e})",
+            sol.p_r[n_bins - 1],
+            peak
+        );
+    }
 }

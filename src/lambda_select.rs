@@ -71,8 +71,6 @@ use anyhow::{anyhow, Result};
 use nalgebra::{DMatrix, DVector};
 
 use crate::nonneg::projected_gradient_nnls;
-use crate::regularise::SecondDerivative;
-use crate::regularise::Regulariser;
 use crate::solver::Solution;
 
 /// If the relative variation of finite GCV scores across the grid is below
@@ -363,6 +361,7 @@ impl GridMatrices {
     /// - `i_observed`   — raw I(q)            (n_q)
     /// - `sigma`        — measurement errors  (n_q)
     /// - `r`            — r-grid values        (n_r)
+    /// - `ltl`          — precomputed LᵀL Gram matrix (n_r × n_r)
     pub fn build(
         k_weighted: &DMatrix<f64>,
         i_weighted: &[f64],
@@ -370,11 +369,8 @@ impl GridMatrices {
         i_observed: &[f64],
         sigma: &[f64],
         r: &[f64],
+        ltl: DMatrix<f64>,
     ) -> Self {
-        let n_r = k_weighted.ncols();
-        let reg = SecondDerivative;
-        let ltl = reg.gram_matrix(n_r);
-
         let ktk = k_weighted.transpose() * k_weighted;
         let i_w_vec = DVector::from_column_slice(i_weighted);
         let kti = k_weighted.transpose() * &i_w_vec;
@@ -759,7 +755,9 @@ mod tests {
         });
         let i_w: Vec<f64> = (1..=n_q).map(|i| (i as f64) * 0.05).collect();
         let r: Vec<f64> = (1..=n_r).map(|i| i as f64 * 10.0).collect();
-        GridMatrices::build(&k_w, &i_w, &k_w.clone(), &i_w, &vec![1.0; n_q], &r)
+        use crate::regularise::Regulariser as _;
+        let ltl = crate::regularise::SecondDerivative.gram_matrix(n_r);
+        GridMatrices::build(&k_w, &i_w, &k_w.clone(), &i_w, &vec![1.0; n_q], &r, ltl)
     }
 
     #[test]

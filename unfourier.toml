@@ -1,2 +1,6 @@
-[preprocessing]
-qmax = 0.30
+[constraints]
+boundary_weight = 0
+d1_smoothness = 1
+
+[regularisation]
+lambda_min = 1e0
