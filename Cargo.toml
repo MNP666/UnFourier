@@ -20,3 +20,6 @@ nalgebra = "0.33"
 anyhow = "1"
 # Typed errors in the library
 thiserror = "2"
+# Serialisation for TOML config file
+serde = { version = "1", features = ["derive"] }
+toml  = "0.8"

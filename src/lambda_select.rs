@@ -70,10 +70,15 @@
 use anyhow::{anyhow, Result};
 use nalgebra::{DMatrix, DVector};
 
-use crate::nonneg::{IterativeClipping, NonNegativityStrategy};
+use crate::nonneg::projected_gradient_nnls;
 use crate::regularise::SecondDerivative;
 use crate::regularise::Regulariser;
 use crate::solver::Solution;
+
+/// If the relative variation of finite GCV scores across the grid is below
+/// this threshold, the GCV landscape is considered flat and the selector
+/// falls back to L-curve to avoid picking an under-regularised λ.
+const GCV_FLAT_THRESHOLD: f64 = 0.10;
 
 // ---------------------------------------------------------------------------
 // LambdaEvaluation
@@ -161,6 +166,29 @@ impl LambdaSelector for GcvSelector {
 
         // Guard against degenerate GCV values (NaN / Inf) which arise when
         // df ≈ n (the hat matrix trace equals n_q, giving a zero denominator).
+        let finite: Vec<f64> = candidates
+            .iter()
+            .filter(|e| e.gcv.is_finite())
+            .map(|e| e.gcv)
+            .collect();
+
+        if finite.is_empty() {
+            return 0;
+        }
+
+        let gcv_min = finite.iter().cloned().fold(f64::INFINITY, f64::min);
+        let gcv_max = finite.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let variation = (gcv_max - gcv_min) / gcv_min;
+
+        if variation < GCV_FLAT_THRESHOLD {
+            eprintln!(
+                "warning: GCV landscape flat ({:.1}% variation across grid); \
+                 falling back to L-curve",
+                variation * 100.0
+            );
+            return LCurveSelector.select(candidates);
+        }
+
         candidates
             .iter()
             .enumerate()
@@ -398,8 +426,8 @@ pub fn evaluate_lambda_grid(
     let n_r = m.r.len();
 
     let mut evaluations = Vec::with_capacity(lambdas.len());
-    let nonneg = IterativeClipping;
 
+    // rayon::par_iter() ready: each lambda evaluation is fully independent.
     for &lambda in lambdas {
         let lambda_eff = lambda * m.trace_ratio;
 
@@ -472,7 +500,8 @@ pub fn evaluate_lambda_grid(
         };
 
         // ---- constrained solve (non-negativity, for final P(r)) ----
-        let p_r = apply_nonneg_tikhonov(&m.ktk, &m.kti, &m.ltl, lambda_eff, &nonneg, n_r)?;
+        // Warm-start from the unconstrained solution already computed above.
+        let p_r = projected_gradient_nnls(&mat, &m.kti, &c_unconstrained, 500, 1e-8);
 
         // Back-calculate I(q) and χ² from constrained solution
         let coeffs = DVector::from_column_slice(&p_r);
@@ -582,76 +611,6 @@ pub fn estimate_lambda_range(_m: &GridMatrices) -> (f64, f64) {
 // Private helpers
 // ---------------------------------------------------------------------------
 
-/// Apply iterative non-negativity clipping to the Tikhonov solution.
-///
-/// Used for the final P(r) once λ is selected. The unconstrained solution used
-/// for λ selection is computed separately (see [`evaluate_lambda_grid`]).
-fn apply_nonneg_tikhonov(
-    ktk: &DMatrix<f64>,
-    kti: &DVector<f64>,
-    ltl: &DMatrix<f64>,
-    lambda_eff: f64,
-    nonneg: &dyn NonNegativityStrategy,
-    n_r: usize,
-) -> Result<Vec<f64>> {
-    let max_iter = 30usize;
-    let mut fixed: Vec<usize> = vec![];
-    let mut p_r = vec![0.0_f64; n_r];
-
-    for _ in 0..=max_iter {
-        p_r = solve_active(ktk, kti, ltl, lambda_eff, &fixed, n_r)?;
-        let violations = nonneg.find_violations(&p_r);
-        if violations.is_empty() {
-            break;
-        }
-        fixed.extend(violations);
-        fixed.sort_unstable();
-        fixed.dedup();
-    }
-
-    Ok(p_r)
-}
-
-/// Solve (KᵀK_a + λ LᵀL_a) c_a = KᵀI_a on the active index set.
-///
-/// Mirrors [`crate::solver::solve_tikhonov_active`] but operates on pre-computed
-/// matrices rather than rebuilding them — safe to call in a tight loop.
-fn solve_active(
-    ktk: &DMatrix<f64>,
-    kti: &DVector<f64>,
-    ltl: &DMatrix<f64>,
-    lambda: f64,
-    fixed: &[usize],
-    n_basis: usize,
-) -> Result<Vec<f64>> {
-    let active: Vec<usize> = (0..n_basis).filter(|j| !fixed.contains(j)).collect();
-    let n_active = active.len();
-
-    if n_active == 0 {
-        return Ok(vec![0.0; n_basis]);
-    }
-
-    let ktk_a = DMatrix::from_fn(n_active, n_active, |i, j| ktk[(active[i], active[j])]);
-    let ltl_a = DMatrix::from_fn(n_active, n_active, |i, j| ltl[(active[i], active[j])]);
-    let kti_a = DVector::from_fn(n_active, |i, _| kti[active[i]]);
-
-    let a = ktk_a + ltl_a * lambda;
-
-    let c_active: DVector<f64> = if let Some(chol) = a.clone().cholesky() {
-        chol.solve(&kti_a)
-    } else {
-        a.lu()
-            .solve(&kti_a)
-            .ok_or_else(|| anyhow!("Active-set Tikhonov solve is singular"))?
-    };
-
-    let mut coeffs = vec![0.0_f64; n_basis];
-    for (k, &j) in active.iter().enumerate() {
-        coeffs[j] = c_active[k];
-    }
-    Ok(coeffs)
-}
-
 /// Reduced χ² from the non-negativity-enforced solution.
 fn reduced_chi_squared(i_observed: &[f64], i_calc: &[f64], sigma: &[f64]) -> f64 {
     let n = i_observed.len();
@@ -710,6 +669,83 @@ mod tests {
 
         let evals = vec![make_eval(f64::INFINITY), make_eval(0.5), make_eval(1.0)];
         assert_eq!(GcvSelector.select(&evals), 1); // index 1 has minimum finite GCV
+    }
+
+    #[test]
+    fn gcv_flat_landscape_falls_back_to_lcurve() {
+        // Five candidates whose GCV values vary by < 1% (well below the 10%
+        // threshold). The GCV minimum is at index 4 (gcv = 0.995).
+        // The L-curve data forms a clear L-shape, so LCurveSelector picks an
+        // interior index (not 4). GcvSelector must agree with LCurveSelector.
+        let make_eval = |gcv: f64, rss: f64, norm: f64| LambdaEvaluation {
+            lambda: 1.0,
+            lambda_eff: 1.0,
+            rss_weighted: rss,
+            solution_norm: norm,
+            df: 5.0,
+            gcv,
+            log_evidence: 0.0,
+            chi_squared: 1.0,
+            solution: Solution {
+                r: vec![],
+                p_r: vec![],
+                p_r_err: None,
+                i_calc: vec![],
+                chi_squared: 1.0,
+                lambda_effective: Some(1.0),
+            },
+        };
+
+        // GCV flat: variation = (1.003 - 0.995) / 0.995 ≈ 0.8% < 10%.
+        // GCV minimum at index 4. L-curve forms a clear elbow — corner away from index 4.
+        let evals = vec![
+            make_eval(1.000, 1e-4, 1e4),
+            make_eval(1.001, 1e-2, 1e3),
+            make_eval(1.002, 1e0, 1e1),
+            make_eval(1.003, 1e3, 1e0),
+            make_eval(0.995, 1e5, 1e-1), // GCV minimum
+        ];
+
+        let gcv_result = GcvSelector.select(&evals);
+        let lcurve_result = LCurveSelector.select(&evals);
+
+        // Fallback must agree with direct L-curve selection.
+        assert_eq!(
+            gcv_result, lcurve_result,
+            "flat GCV should delegate to L-curve (got index {gcv_result}, lcurve chose {lcurve_result})"
+        );
+        // And must differ from the raw GCV minimum (index 4).
+        assert_ne!(
+            gcv_result, 4,
+            "flat GCV fallback must not return the GCV minimum (index 4)"
+        );
+    }
+
+    #[test]
+    fn gcv_normal_landscape_uses_gcv_minimum() {
+        // GCV values with > 10% variation: no fallback, GCV minimum is returned.
+        let make_eval = |gcv: f64| LambdaEvaluation {
+            lambda: 1.0,
+            lambda_eff: 1.0,
+            rss_weighted: 1.0,
+            solution_norm: 1.0,
+            df: 5.0,
+            gcv,
+            log_evidence: 0.0,
+            chi_squared: 1.0,
+            solution: Solution {
+                r: vec![],
+                p_r: vec![],
+                p_r_err: None,
+                i_calc: vec![],
+                chi_squared: 1.0,
+                lambda_effective: Some(1.0),
+            },
+        };
+
+        // Variation = (2.0 - 0.5) / 0.5 = 300% > 10% — no fallback.
+        let evals = vec![make_eval(2.0), make_eval(0.5), make_eval(1.0)];
+        assert_eq!(GcvSelector.select(&evals), 1); // GCV minimum at index 1
     }
 
     /// Build the same tiny synthetic GridMatrices used in other tests.

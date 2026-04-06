@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use nalgebra::{DMatrix, DVector};
 use thiserror::Error;
 
-use crate::nonneg::{IterativeClipping, NonNegativityStrategy};
+use crate::nonneg::{projected_gradient_nnls, NonNegativityStrategy, ProjectedGradient};
 use crate::regularise::{Regulariser, SecondDerivative};
 
 #[derive(Debug, Error)]
@@ -197,13 +197,13 @@ pub struct TikhonovSolver {
 }
 
 impl TikhonovSolver {
-    /// Construct with `SecondDerivative` regularisation and `IterativeClipping`.
+    /// Construct with `SecondDerivative` regularisation and `ProjectedGradient`.
     pub fn new(lambda: f64) -> Self {
         Self {
             lambda,
             regulariser: Box::new(SecondDerivative),
-            nonneg: Box::new(IterativeClipping),
-            max_nonneg_iter: 20,
+            nonneg: Box::new(ProjectedGradient::default()),
+            max_nonneg_iter: 500,
         }
     }
 
@@ -241,8 +241,7 @@ impl Solver for TikhonovSolver {
 
         let i_w_vec = DVector::from_column_slice(i_weighted);
 
-        // Pre-compute KᵀK and KᵀI once; both are reused across non-negativity
-        // iterations without rebuilding from the active columns each time.
+        // Pre-compute KᵀK and KᵀI.
         let ktk = k_weighted.transpose() * k_weighted;
         let kti = k_weighted.transpose() * &i_w_vec;
 
@@ -254,20 +253,21 @@ impl Solver for TikhonovSolver {
         let trace_ratio = ktk.trace() / ltl.trace().max(1e-10);
         let lambda_eff = self.lambda * trace_ratio;
 
-        // Non-negativity loop: accumulate fixed-to-zero indices and re-solve.
-        let mut fixed: Vec<usize> = vec![];
-        let mut p_r = vec![0.0_f64; n_r];
+        // Full system matrix A = KᵀK + λ_eff LᵀL.
+        let a_full = &ktk + &ltl * lambda_eff;
 
-        for _ in 0..=self.max_nonneg_iter {
-            p_r = solve_tikhonov_active(&ktk, &kti, &ltl, lambda_eff, &fixed, n_r)?;
-            let violations = self.nonneg.find_violations(&p_r);
-            if violations.is_empty() {
-                break;
-            }
-            fixed.extend(violations);
-            fixed.sort_unstable();
-            fixed.dedup();
-        }
+        // Unconstrained solve (warm start for projected gradient).
+        let c_unc = solve_unconstrained(&a_full, &kti)?;
+
+        // Apply non-negativity constraint (or not).
+        let p_r: Vec<f64> = if !self.nonneg.is_constraining() {
+            c_unc.iter().cloned().collect()
+        } else {
+            // Projected gradient NNLS: converges to the true constrained minimum
+            // without the cascade-zeroing problem of iterative clipping.
+            // Each call is independent of other λ evaluations → rayon::par_iter() ready.
+            projected_gradient_nnls(&a_full, &kti, &c_unc, self.max_nonneg_iter, 1e-8)
+        };
 
         let coeffs = DVector::from_column_slice(&p_r);
         let i_calc: Vec<f64> = (k_unweighted * &coeffs).iter().cloned().collect();
@@ -288,48 +288,19 @@ impl Solver for TikhonovSolver {
 // Private helpers
 // ---------------------------------------------------------------------------
 
-/// Solve (KᵀK_a + λ · LᵀL_a) c_a = KᵀI_a restricted to the active index set.
+/// Solve Ac = b for the unconstrained Tikhonov system.
 ///
-/// Takes pre-computed `ktk` (n_basis × n_basis) and `kti` (n_basis) so that
-/// the matrix products are not recomputed on every non-negativity iteration.
-/// Returns a full-length vector with zeros at fixed positions.
-fn solve_tikhonov_active(
-    ktk: &DMatrix<f64>,
-    kti: &DVector<f64>,
-    ltl: &DMatrix<f64>,
-    lambda: f64,
-    fixed: &[usize],
-    n_basis: usize,
-) -> Result<Vec<f64>> {
-    let active: Vec<usize> = (0..n_basis).filter(|j| !fixed.contains(j)).collect();
-    let n_active = active.len();
-
-    if n_active == 0 {
-        return Ok(vec![0.0; n_basis]);
-    }
-
-    // Extract [active × active] submatrices and the active subvector of KᵀI.
-    let ktk_a = DMatrix::from_fn(n_active, n_active, |i, j| ktk[(active[i], active[j])]);
-    let ltl_a = DMatrix::from_fn(n_active, n_active, |i, j| ltl[(active[i], active[j])]);
-    let kti_a = DVector::from_fn(n_active, |i, _| kti[active[i]]);
-
-    let a = ktk_a + ltl_a * lambda;
-
-    // Cholesky is the natural choice for symmetric positive-definite systems.
-    // Fall back to LU if needed (e.g. nearly-singular active set).
-    let c_active: DVector<f64> = if let Some(chol) = a.clone().cholesky() {
-        chol.solve(&kti_a)
+/// Tries Cholesky first (optimal for symmetric positive-definite A); falls
+/// back to LU if Cholesky fails (e.g. near-singular systems at very small λ).
+fn solve_unconstrained(a: &DMatrix<f64>, b: &DVector<f64>) -> Result<DVector<f64>> {
+    if let Some(chol) = a.clone().cholesky() {
+        Ok(chol.solve(b))
     } else {
-        a.lu()
-            .solve(&kti_a)
-            .ok_or_else(|| anyhow!("Tikhonov solve failed: system is singular"))?
-    };
-
-    let mut coeffs = vec![0.0_f64; n_basis];
-    for (k, &j) in active.iter().enumerate() {
-        coeffs[j] = c_active[k];
+        a.clone()
+            .lu()
+            .solve(b)
+            .ok_or_else(|| anyhow!("Tikhonov solve failed: system is singular"))
     }
-    Ok(coeffs)
 }
 
 /// Reduced chi-squared: Σ[(I_obs − I_calc)² / σ²] / N.
@@ -348,4 +319,54 @@ fn reduced_chi_squared(i_observed: &[f64], i_calc: &[f64], sigma: &[f64]) -> f64
         })
         .sum::<f64>()
         / n as f64
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nalgebra::DMatrix;
+
+    #[test]
+    fn tikhonov_nnls_3x3_clamps_negative_bins_to_zero() {
+        // K = I (3×3 identity), λ = 0.
+        // Weighted system is the same as unweighted when σ = [1, 1, 1].
+        // With i_weighted = [0.1, 2.0, -0.5]:
+        //   unconstrained c = [0.1, 2.0, -0.5]
+        //   NNLS solution   = [0.1, 2.0, 0.0]  (last bin clamped)
+        let k = DMatrix::<f64>::identity(3, 3);
+        let i_w = vec![0.1_f64, 2.0, -0.5];
+        let sigma = vec![1.0_f64; 3];
+        let r = vec![10.0_f64, 20.0, 30.0];
+
+        let solver = TikhonovSolver::new(0.0);
+        let sol = solver
+            .solve(&k, &i_w, &k, &i_w, &sigma, &r)
+            .expect("solve must succeed");
+
+        assert_eq!(sol.p_r.len(), 3);
+        assert!(
+            sol.p_r.iter().all(|&x| x >= 0.0),
+            "all P(r) values must be non-negative; got {:?}",
+            sol.p_r
+        );
+        assert!(
+            (sol.p_r[0] - 0.1).abs() < 1e-5,
+            "p_r[0] should be ~0.1, got {}",
+            sol.p_r[0]
+        );
+        assert!(
+            (sol.p_r[1] - 2.0).abs() < 1e-5,
+            "p_r[1] should be ~2.0, got {}",
+            sol.p_r[1]
+        );
+        assert!(
+            sol.p_r[2].abs() < 1e-5,
+            "p_r[2] should be ~0.0, got {}",
+            sol.p_r[2]
+        );
+    }
 }
