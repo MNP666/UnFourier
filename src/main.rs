@@ -287,9 +287,10 @@ fn main() -> Result<()> {
     let mut args = Args::parse();
 
     // ---- 0. Load optional TOML config and fill unset CLI args ---------------
-    // boundary_multiplier: None = disabled, Some(m) where m is the user-supplied
-    // multiplier (0.0 means "use default weight ×1"; positive means "×m").
-    let mut boundary_multiplier: Option<f64> = None;
+    // boundary_multiplier: None = disabled (not recommended), Some(m) where m
+    // scales the auto weight.  Default Some(1.0) = always-on, because both bases
+    // now include boundary ghost coefficients that must be pinned to 0.
+    let mut boundary_multiplier: Option<f64> = Some(1.0);
 
     // d1_weight: effective relative weight for the first-derivative penalty.
     // None / -1 = SecondDerivative only (default). 0.0 = 1.0. positive = explicit.
@@ -522,22 +523,20 @@ fn main() -> Result<()> {
 
     // ---- 4 + 5. Build system and solve -----------------------------------
 
-    // Compute boundary constraint weight for rect basis.
+    // Compute boundary constraint weight (applies to both rect and spline).
+    // Both bases now include boundary ghost coefficients in the design matrix;
+    // these must be pinned to 0 for the boundary conditions to hold.
     // w_default = sqrt(N) × rms(1/σ); multiplier scales it.
-    let boundary_w: Option<f64> = if matches!(args.basis, BasisChoice::Rect) {
-        boundary_multiplier.map(|m| {
-            let rms_inv_sigma = (data
-                .error
-                .iter()
-                .map(|s| 1.0 / s / s)
-                .sum::<f64>()
-                / data.error.len() as f64)
-                .sqrt();
-            (data.len() as f64).sqrt() * rms_inv_sigma * m
-        })
-    } else {
-        None
-    };
+    let boundary_w: Option<f64> = boundary_multiplier.map(|m| {
+        let rms_inv_sigma = (data
+            .error
+            .iter()
+            .map(|s| 1.0 / s / s)
+            .sum::<f64>()
+            / data.error.len() as f64)
+            .sqrt();
+        (data.len() as f64).sqrt() * rms_inv_sigma * m
+    });
 
     // Build the regulariser (and its Gram matrix) once.
     let n_basis = basis.r_values().len();
@@ -554,7 +553,7 @@ fn main() -> Result<()> {
     };
     let ltl = reg.gram_matrix(n_basis);
 
-    let mut solution = run_solve(
+    let solution = run_solve(
         &data,
         basis.as_ref(),
         &method,
@@ -565,23 +564,9 @@ fn main() -> Result<()> {
         reg,
     )?;
 
-    // For the spline basis the polynomial is structurally zero at r=0 and
-    // r=r_max (the endpoint basis functions are excluded from the design
-    // matrix), but r_values() only contains interior Greville abscissae so
-    // the output never shows those boundary values explicitly.  Add them so
-    // that the output curve visibly reaches zero at both ends.
-    if matches!(args.basis, BasisChoice::Spline) {
-        solution.r.insert(0, 0.0);
-        solution.p_r.insert(0, 0.0);
-        if let Some(ref mut err) = solution.p_r_err {
-            err.insert(0, 0.0);
-        }
-        solution.r.push(r_max);
-        solution.p_r.push(0.0);
-        if let Some(ref mut err) = solution.p_r_err {
-            err.push(0.0);
-        }
-    }
+    // Both bases now include r=0 and r=r_max in r_values() (as boundary ghost
+    // points or endpoint B-splines), so the boundary values appear in the output
+    // naturally — no post-hoc insertion needed.
 
     if args.verbose {
         if let Some(lam_eff) = solution.lambda_effective {

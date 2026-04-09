@@ -24,10 +24,12 @@ A Rust implementation of Indirect Fourier Transformation (IFT) for Small Angle X
 |-----------|-------------|--------|
 | M1 | Naive least-squares, end-to-end pipeline | ✅ Done |
 | M2 | Tikhonov regularisation with manual λ | ✅ Done |
-| M3 | Automatic λ selection (GCV and L-curve) | ✅ Done |
-| M4 | Bayesian IFT with posterior error bars | 🔲 Planned |
-| M5 | Cubic B-spline basis functions | 🔲 Planned |
-| M6 | Preprocessing pipeline and real-world data | 🔲 Planned |
+| M3 | Automatic λ selection (GCV, L-curve) | ✅ Done |
+| M4 | Bayesian IFT with posterior error bars | ✅ Done |
+| M5 | Cubic B-spline basis functions | ✅ Done |
+| M6 | Full preprocessing pipeline (rebinning, q-range, SNR trimming) | ✅ Done |
+| M7 | Real-data validation and GCV robustness (GCV-fallback, NNLS) | ✅ Done |
+| M8 | Perceptual constraints (boundary enforcement, combined regulariser) | ✅ Done |
 
 See [MILESTONES.md](MILESTONES.md) for the full plan and rationale.
 
@@ -56,18 +58,25 @@ Arguments:
   <INPUT>  3-column .dat file: q (Å⁻¹), I(q), σ(q)
 
 Options:
-  --method <METHOD>   gcv | lcurve | manual  [default: gcv]
-  --lambda <LAMBDA>   Regularisation strength (manual mode)
-  --rmax <RMAX>       Maximum r in Å  [default: π / q_min]
-  --npoints <N>       r grid points  [default: 100]
-  --lambda-count <N>  Grid size for automatic search  [default: 60]
-  --lambda-min <F>    Lower bound of λ search grid  [default: 1e-6]
-  --lambda-max <F>    Upper bound of λ search grid  [default: 1e3]
-  -o, --output <FILE>     Write P(r) here  [default: stdout]
-  --fit-output <FILE>     Write back-calculated I(q) here
-  -v, --verbose           Print diagnostics to stderr
-  -h, --help              Print help
-  -V, --version           Print version
+  --method <METHOD>          gcv | lcurve | bayes | manual  [default: gcv]
+  --lambda <LAMBDA>          Regularisation strength (manual mode)
+  --rmax <RMAX>              Maximum r in Å  [default: π / q_min]
+  --basis <BASIS>            rect | spline  [default: rect]
+  --n-basis <N>              Number of free basis parameters
+  --npoints <N>              r grid points for rect basis  [default: 100]
+  --lambda-count <N>         Grid size for automatic search  [default: 60]
+  --lambda-min <F>           Lower bound of λ search grid
+  --lambda-max <F>           Upper bound of λ search grid
+  --negative-handling <H>    clip | omit | keep  [default: clip]
+  --qmin <F>                 Discard points with q below this value (Å⁻¹)
+  --qmax <F>                 Discard points with q above this value (Å⁻¹)
+  --snr-cutoff <F>           Trim high-q tail where I/σ < threshold  [default: 0]
+  --rebin <N>                Rebin into N log-spaced q bins  [default: 0]
+  -o, --output <FILE>        Write P(r) here  [default: stdout]
+  --fit-output <FILE>        Write back-calculated I(q) here
+  -v, --verbose              Print diagnostics to stderr
+  -h, --help                 Print help
+  -V, --version              Print version
 ```
 
 ### Examples
@@ -79,16 +88,52 @@ unfourier data.dat --rmax 150 --output pr.dat --fit-output fit.dat --verbose
 # L-curve selection
 unfourier data.dat --rmax 150 --method lcurve --output pr.dat
 
-# Manual λ (M2-style)
+# Bayesian IFT — produces 3-column output with error bars: r, P(r), σ_P(r)
+unfourier data.dat --rmax 150 --method bayes --output pr.dat --verbose
+
+# B-spline basis (structurally zero at both boundaries)
+unfourier data.dat --rmax 150 --basis spline --n-basis 20 --output pr.dat
+
+# Manual λ
 unfourier data.dat --rmax 150 --lambda 0.01 --output pr.dat
+
+# Preprocessing: trim q-range, SNR cutoff, and rebin
+unfourier data.dat --rmax 55 --qmin 0.01 --qmax 0.30 --snr-cutoff 3 --rebin 200
 
 # Wider λ search range
 unfourier data.dat --rmax 150 --lambda-min 1e-8 --lambda-max 1e5
 ```
 
+### TOML configuration
+
+For reproducible runs, create `unfourier.toml` in the working directory. CLI flags take precedence over TOML values.
+
+```toml
+[regularisation]
+method = "gcv"          # gcv | lcurve | bayes | manual
+lambda_min = 1e-6       # lower bound of λ search grid
+lambda_max = 1e3        # upper bound of λ search grid
+
+[preprocessing]
+qmin = 0.01             # Å⁻¹ — discard points below this q
+qmax = 0.35             # Å⁻¹ — discard points above this q
+
+[basis]
+npoints = 100           # number of r grid points / basis parameters
+
+[constraints]
+# Boundary enforcement: P(r=0) = P(r=D_max) = 0 (rect basis only)
+# -1 = disabled (default), 0 = automatic weight, >0 = explicit multiplier
+boundary_weight = 0.0
+
+# First-derivative slope penalty (combined with curvature regularisation)
+# -1 = disabled (default), 0 = weight 1.0, >0 = explicit weight
+d1_smoothness = -1.0
+```
+
 ### Input format
 
-Whitespace-delimited, three columns, lines starting with `#` are ignored:
+Whitespace-delimited, three columns; lines starting with `#` are ignored:
 
 ```
 # q(1/A)         I(q)          sigma(q)
@@ -99,7 +144,7 @@ Whitespace-delimited, three columns, lines starting with `#` are ignored:
 
 ### Output format
 
-Two-column `r  P(r)`, with a `#` header line. If `--fit-output` is given, a four-column file `q  I_obs  I_calc  sigma` is also written.
+Two-column `r  P(r)`, with a `#` header line. With `--method bayes`, three columns: `r  P(r)  σ_P(r)`. If `--fit-output` is given, a four-column file `q  I_obs  I_calc  sigma` is also written.
 
 ---
 
@@ -108,41 +153,86 @@ Two-column `r  P(r)`, with a `#` header line. If `--fit-output` is given, a four
 ```
 UnFourier/
 ├── src/
-│   ├── main.rs           # CLI entry point
+│   ├── main.rs           # CLI entry point and pipeline wiring
 │   ├── lib.rs            # Module exports
 │   ├── data.rs           # .dat parser, SaxsData struct
-│   ├── basis.rs          # BasisSet trait + UniformGrid implementation
-│   ├── kernel.rs         # Weighted kernel matrix construction
+│   ├── basis.rs          # BasisSet trait, UniformGrid (rect), CubicBSpline (M5)
+│   ├── bspline.rs        # Cox–de Boor B-spline evaluation and quadrature (M5)
+│   ├── kernel.rs         # Weighted system matrix, boundary constraint augmentation
 │   ├── solver.rs         # Solver trait, LeastSquaresSvd, TikhonovSolver
-│   ├── regularise.rs     # Regulariser trait + SecondDerivative
-│   ├── nonneg.rs         # NonNegativityStrategy trait + IterativeClipping
-│   ├── lambda_select.rs  # LambdaSelector trait, GCV, L-curve, grid evaluation
-│   ├── preprocess.rs     # Preprocessor trait + Identity (pipeline stub)
+│   ├── regularise.rs     # Regulariser trait + SecondDerivative, FirstDerivative,
+│   │                     #   CombinedDerivative (M8)
+│   ├── nonneg.rs         # NonNegativityStrategy trait, ProjectedGradient NNLS
+│   ├── lambda_select.rs  # LambdaSelector trait, GCV, L-curve, BayesianEvidence,
+│   │                     #   GridMatrices, evaluate_lambda_grid
+│   ├── preprocess.rs     # Preprocessor trait, ClipNegative, OmitNonPositive,
+│   │                     #   QRangeSelector, LogRebin, PreprocessingPipeline (M6)
+│   ├── config.rs         # unfourier.toml parser (TOML config, M7)
 │   └── output.rs         # P(r) and fit file writers
 ├── Dev/
-│   ├── gen_sphere.py     # Generate synthetic sphere SAXS data
-│   ├── gen_debye.py      # Generate synthetic Debye/Gaussian-chain data
-│   ├── plot_pr.py        # Plot P(r) output vs analytic reference
-│   └── sweep_noise.py    # M3 validation: sweep noise levels, compare GCV / L-curve
+│   ├── gen_sphere.py          # Generate synthetic sphere SAXS data
+│   ├── gen_debye.py           # Generate synthetic Debye/Gaussian-chain data
+│   ├── plot_pr.py             # Plot P(r) output vs analytic reference
+│   ├── sweep_noise.py         # M3 validation: sweep noise, compare GCV/L-curve
+│   ├── monte_carlo_coverage.py# M4 validation: Bayesian error bar coverage
+│   ├── parse_gnom.py          # Parse GNOM .out files for reference P(r)
+│   └── validate_real_data.py  # M7/M8 validation against SASDME2, SASDF42, SASDYU3
+├── data/
+│   └── dat_ref/               # Reference SAXS datasets (SASDME2, SASDF42, SASDYU3)
+├── pipeline.md           # Pipeline description with mathematics
 ├── MILESTONES.md         # Detailed milestone plan with rationale
-├── saxs_ift_postmortem.md # Mathematical analysis of regularisation washout on sphere data
+├── saxs_ift_postmortem.md# Mathematical analysis of sphere-data regularisation washout
 ├── Cargo.toml
 └── LICENSE               # GPLv3
 ```
 
 ---
 
+## Architecture
+
+The pipeline in `main.rs` is: **parse → preprocess → build basis → build system → [constrain] → solve → output**.
+
+Each stage is abstracted behind a trait, making the system extensible without modifying the pipeline:
+
+| Module | Trait | Implementations |
+|--------|-------|-----------------|
+| `data.rs` | — | `SaxsData`: holds q, I(q), σ(q); parses 3-column `.dat` files |
+| `basis.rs` | `BasisSet` | `UniformGrid` (rect bins), `CubicBSpline` (clamped B-splines) |
+| `kernel.rs` | — | `build_weighted_system`, `append_boundary_constraints` |
+| `regularise.rs` | `Regulariser` | `SecondDerivative`, `FirstDerivative`, `CombinedDerivative` |
+| `solver.rs` | `Solver` | `LeastSquaresSvd` (M1), `TikhonovSolver` (M2+) |
+| `lambda_select.rs` | `LambdaSelector` | `GcvSelector`, `LCurveSelector`, `BayesianEvidence` |
+| `nonneg.rs` | `NonNegativityStrategy` | `ProjectedGradient` (NNLS), `NoConstraint` |
+| `preprocess.rs` | `Preprocessor` | `ClipNegative`, `OmitNonPositive`, `QRangeSelector`, `LogRebin` |
+| `config.rs` | — | `UnfourierConfig`: TOML-based configuration |
+
+See [pipeline.md](pipeline.md) for a detailed mathematical description of each stage.
+
+---
+
 ## Validation strategy
 
-Every milestone validates against two synthetic fixtures. See [MILESTONES.md](MILESTONES.md) for the full rationale and [saxs_ift_postmortem.md](saxs_ift_postmortem.md) for the mathematics behind why the sphere is unsuitable as a noisy benchmark.
-
-**Sphere (noiseless only):** The solid sphere has a fully analytic I(q) and P(r), making it a sharp test of kernel correctness. It is used without noise because the proportional noise model σ = I/k diverges at the sphere's exact intensity zeros, making any regulariser degenerate.
-
-**Debye/Gaussian chain (noisy):** The Debye form factor decays monotonically with no zeros, so σ stays well-conditioned at all q. This is the primary benchmark for noisy data from M2 onwards. Generate test data with:
+**Debye/Gaussian chain (primary noisy benchmark):** The Debye form factor decays monotonically with no zeros, so σ stays well-conditioned at all q. Generate synthetic data with:
 
 ```bash
 python Dev/gen_debye.py --rg 30 --k 5 --output Dev/debye_k5.dat \
     --pr-reference Dev/debye_pr_ref.dat
+```
+
+**Sphere (noiseless only):** The solid sphere has a fully analytic I(q) and P(r), making it a sharp test of kernel correctness. It is used without noise because the proportional noise model σ = I/k diverges at the sphere's exact intensity zeros, making any regulariser degenerate. See [saxs_ift_postmortem.md](saxs_ift_postmortem.md) for the analysis.
+
+**Real SAXS data (M7/M8):** Three datasets from the SASBDB are used for end-to-end validation:
+
+| Dataset | Description | Key challenge |
+|---------|-------------|---------------|
+| SASDME2 | Well-behaved protein | Baseline pass |
+| SASDF42 | Moderate signal-to-noise | Open right boundary, λ sensitivity |
+| SASDYU3 | Dense dataset (1696 points) | Requires log-rebinning |
+
+Run the full validation suite with:
+
+```bash
+python Dev/validate_real_data.py
 ```
 
 ---
@@ -155,6 +245,7 @@ python Dev/gen_debye.py --rg 30 --k 5 --output Dev/debye_k5.dat \
 | [nalgebra](https://nalgebra.org) | Linear algebra (matrices, SVD, Cholesky) |
 | [anyhow](https://docs.rs/anyhow) | Ergonomic error handling in the binary |
 | [thiserror](https://docs.rs/thiserror) | Typed errors in the library |
+| [serde](https://docs.rs/serde) + [toml](https://docs.rs/toml) | TOML configuration parsing |
 
 ---
 

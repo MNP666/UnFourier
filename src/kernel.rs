@@ -130,19 +130,22 @@ mod tests {
         assert_eq!(i_w[4], 0.0);
     }
 
-    /// End-to-end: a 5-bin rect solve with a large boundary weight should
-    /// drive p_r[0] and p_r[4] to essentially zero, even when a flat
-    /// intensity signal would otherwise spread weight into the edge bins.
+    /// End-to-end: a 5-interior-bin rect basis (7 total with boundary ghosts)
+    /// with a large boundary weight should drive the boundary ghost coefficients
+    /// (indices 0 and 6) to essentially zero.
     #[test]
     fn large_boundary_weight_clamps_edge_bins() {
         use crate::basis::{BasisSet, UniformGrid};
         use crate::data::SaxsData;
         use crate::solver::{Solver, TikhonovSolver};
 
-        // Build a 5-bin rect basis over [0, 5] Å.
+        // Build a 5-interior-bin rect basis over [0, 5] Å.
+        // After the boundary-ghost change the basis has 7 grid points total.
         let r_max = 5.0_f64;
-        let n_bins = 5_usize;
-        let basis = UniformGrid::new(r_max, n_bins);
+        let n_interior = 5_usize;
+        let n_total = n_interior + 2; // 7: ghost at 0, 5 interior bins, ghost at r_max
+        let basis = UniformGrid::new(r_max, n_interior);
+        assert_eq!(basis.n_basis(), n_total);
 
         // Synthetic q grid: 30 evenly-spaced q values from 0.05 to 0.5 Å⁻¹.
         let n_q = 30_usize;
@@ -150,11 +153,12 @@ mod tests {
             .map(|i| 0.05 + i as f64 * (0.45 / (n_q - 1) as f64))
             .collect();
 
-        // Forward-calculate a reference I(q) from a uniform P(r) = 1 for all bins.
-        // This is deliberately flat so the unconstrained solve would prefer to
-        // spread weight evenly, including into the edge bins.
+        // Forward-calculate a reference I(q) from interior bins = 1, boundary ghosts = 0.
+        // Ghost bins have zero kernel contribution so setting them to 0 is correct.
         let k_raw = basis.build_kernel_matrix(&q);
-        let c_flat = nalgebra::DVector::from_element(n_bins, 1.0_f64);
+        let mut c_flat = nalgebra::DVector::from_element(n_total, 1.0_f64);
+        c_flat[0] = 0.0;           // boundary ghost — zero kernel, pinned to 0
+        c_flat[n_total - 1] = 0.0; // boundary ghost — zero kernel, pinned to 0
         let i_ref = (k_raw.clone() * c_flat).iter().cloned().collect::<Vec<_>>();
 
         // Uniform small errors (σ = 0.01).
@@ -163,8 +167,6 @@ mod tests {
         let data = SaxsData { q, intensity: i_ref, error: sigma };
 
         // Build weighted system and apply a large boundary weight.
-        // Use 1e3 × rms(1/σ) × sqrt(N) so the weight is large relative to
-        // the data but doesn't inflate trace(KᵀK) so much that λ_eff blows up.
         let (mut kw, mut iw) = build_weighted_system(&basis, &data);
         let rms_inv_sigma = (data.error.iter().map(|s| 1.0 / s / s).sum::<f64>()
             / data.error.len() as f64)
@@ -179,20 +181,21 @@ mod tests {
             .solve(&kw, &iw, &k_raw, &data.intensity, &data.error, basis.r_values())
             .unwrap();
 
+        assert_eq!(sol.p_r.len(), n_total);
         let peak = sol.p_r.iter().cloned().fold(0.0_f64, f64::max);
         assert!(peak > 0.0, "solution is all-zero");
 
         let threshold = 1e-3 * peak;
         assert!(
             sol.p_r[0] < threshold,
-            "p_r[0] = {:.3e} is not ≈ 0 (peak={:.3e})",
+            "p_r[0] (ghost r=0) = {:.3e} is not ≈ 0 (peak={:.3e})",
             sol.p_r[0],
             peak
         );
         assert!(
-            sol.p_r[n_bins - 1] < threshold,
-            "p_r[n-1] = {:.3e} is not ≈ 0 (peak={:.3e})",
-            sol.p_r[n_bins - 1],
+            sol.p_r[n_total - 1] < threshold,
+            "p_r[n_total-1] (ghost r=r_max) = {:.3e} is not ≈ 0 (peak={:.3e})",
+            sol.p_r[n_total - 1],
             peak
         );
     }
