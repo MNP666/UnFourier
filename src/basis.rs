@@ -41,18 +41,15 @@ pub trait BasisSet: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Uniform rectangular basis: P(r) is approximated as piecewise constant on a
-/// uniform grid of `n_points` interior bins over (0, r_max), plus two explicit
-/// boundary points at r = 0 and r = r_max.
+/// uniform grid of `n_points` interior bins over (0, r_max).
 ///
-/// The full r-grid has `n_points + 2` entries:
-///   r[0]          = 0        (boundary ghost — zero kernel contribution)
-///   r[1..n+1]     = bin centres (j + 0.5) · Δr  (interior bins, kernel Δr·sinc)
-///   r[n+1]        = r_max   (boundary ghost — zero kernel contribution)
+/// The r-grid has `n_points` entries (bin centres only):
+///   r[j] = (j + 0.5) · Δr  for j = 0 … n_points−1
 ///
-/// The two boundary ghosts are pinned to zero by `append_boundary_constraints`.
-/// Because the regulariser operates on all n+2 coefficients, the first-derivative
-/// penalty now includes the jump from c[0]=0 to c[1] and from c[n] to c[n+1]=0,
-/// which eliminates the discontinuity artefact at both boundaries.
+/// Boundary values P(0) = P(r_max) = 0 are imposed via the
+/// boundary-anchored regulariser (which penalises c[0] and c[n-1] as
+/// slopes from the implicit zero boundaries) and post-hoc insertion of
+/// explicit (r=0, P=0) and (r=r_max, P=0) rows in the output.
 ///
 /// This is a deliberately simple starting point. Replace with `CubicBSpline`
 /// in M5 for a smoother, more accurate representation with fewer coefficients.
@@ -63,21 +60,17 @@ pub struct UniformGrid {
 }
 
 impl UniformGrid {
-    /// Create a uniform grid with `n_points` interior bins plus boundary ghosts.
+    /// Create a uniform grid with `n_points` interior bin centres.
     ///
-    /// Interior bin centres: r_j = (j + 0.5) · Δr  for j = 0 … n_points−1.
-    /// The returned basis has `n_points + 2` r-values and kernel columns.
+    /// Bin centres: r_j = (j + 0.5) · Δr  for j = 0 … n_points−1.
     pub fn new(r_max: f64, n_points: usize) -> Self {
         assert!(r_max > 0.0, "r_max must be positive");
         assert!(n_points > 0, "n_points must be at least 1");
 
         let delta_r = r_max / n_points as f64;
-        let mut r = Vec::with_capacity(n_points + 2);
-        r.push(0.0);
-        for j in 0..n_points {
-            r.push((j as f64 + 0.5) * delta_r);
-        }
-        r.push(r_max);
+        let r = (0..n_points)
+            .map(|j| (j as f64 + 0.5) * delta_r)
+            .collect();
 
         Self { r, r_max, delta_r }
     }
@@ -93,46 +86,39 @@ impl UniformGrid {
 
 /// Cubic B-spline basis on `[0, r_max]` with zero boundary conditions.
 ///
-/// P(r) is represented as a linear combination of `n_free + 2` cubic B-spline
-/// functions, where the two endpoint functions (B_0 at r=0, B_{n-1} at r=r_max)
-/// are included in the design matrix but pinned to zero by boundary constraints:
+/// P(r) is represented as a linear combination of `n_basis` interior cubic
+/// B-spline functions.  The two endpoint B-splines (B_0 at r=0, B_{n-1} at
+/// r=r_max) are **excluded** from the design matrix; their coefficients are
+/// implicitly zero, which enforces P(0) = P(r_max) = 0 by construction.
 ///
 /// ```text
-/// P(r) = Σ_{j=0}^{n_free+1}  c_j · B_j(r),   with c_0 = c_{n_free+1} = 0
+/// P(r) = Σ_{j=1}^{n_basis}  c_j · B_j(r)   (B_0 and B_{n+1} dropped)
 /// ```
 ///
-/// Keeping the endpoint basis functions in the design matrix means the
-/// regulariser operates on all n_free + 2 coefficients, so the first-derivative
-/// penalty naturally includes the jumps c_1 − c_0 and c_{n_free+1} − c_{n_free}.
-/// This eliminates the slope discontinuity at both boundaries.
+/// Boundary conditions P(0)=P'(0)=P(r_max)=P'(r_max)=0 are ensured by the
+/// boundary-anchored regulariser (which penalises slopes from/to the implicit
+/// zero boundary) together with a post-solve hard projection of the
+/// boundary-adjacent coefficients to zero.
 ///
 /// # Parameters
 ///
-/// `n_basis` is the number of **free** (interior) parameters.  The total number
-/// of basis functions (including the two pinned endpoints) is `n_basis + 2`.
-/// The relationship to the underlying knot vector is:
-///
-/// ```text
-/// n_interior_knots = n_basis - 2
-/// n_total          = n_basis + 2
-/// ```
-///
-/// The default recommended value is `n_basis = 20` (gives 22 total columns).
+/// `n_basis` is the number of **free** (interior) parameters.
+/// The underlying knot vector uses `n_basis - 2` interior knots.
+/// The default recommended value is `n_basis = 20`.
 pub struct CubicBSpline {
     knots: Vec<f64>,
-    /// Greville abscissae of ALL basis functions (B_0 … B_{n_total-1}).
-    /// Includes the endpoint abscissae at 0 and r_max.
-    r_all: Vec<f64>,
+    /// Greville abscissae of the n_basis INTERIOR basis functions only
+    /// (B_1 … B_{n_basis}, excluding the two endpoint functions).
+    r_interior: Vec<f64>,
     r_max: f64,
 }
 
 impl CubicBSpline {
     /// Create a cubic B-spline basis on `[0, r_max]` with `n_basis` free parameters.
     ///
-    /// Interior knots are placed uniformly.  The returned basis has `n_basis + 2`
-    /// columns (free interior functions plus the two boundary functions at 0 and r_max).
-    /// Boundary conditions P(0) = P(r_max) = 0 must be enforced by calling
-    /// `append_boundary_constraints` on the assembled weighted system.
+    /// Interior knots are placed uniformly.  The returned basis has `n_basis`
+    /// columns (interior B-splines B_1 … B_{n_basis} only; the two endpoint
+    /// B-splines are excluded so that P(0)=P(r_max)=0 holds by construction).
     ///
     /// # Panics
     ///
@@ -144,32 +130,35 @@ impl CubicBSpline {
         let n_interior = n_basis - 2;
         let knots = bspline::clamped_knots(r_max, n_interior);
 
-        // All Greville abscissae including the two endpoint ones (at 0 and r_max).
-        let r_all = bspline::greville(&knots, 3);
+        // All Greville abscissae (n_basis + 2 total), then keep only the
+        // interior ones (indices 1..n_basis+1), dropping the two endpoints.
+        let all_greville = bspline::greville(&knots, 3);
+        let r_interior = all_greville[1..all_greville.len() - 1].to_vec();
 
-        Self { knots, r_all, r_max }
+        Self { knots, r_interior, r_max }
     }
 }
 
 impl BasisSet for CubicBSpline {
     fn r_values(&self) -> &[f64] {
-        &self.r_all
+        &self.r_interior
     }
 
     fn r_max(&self) -> f64 {
         self.r_max
     }
 
-    /// K_ij = 4π ∫ B_j(r) sin(q_i r)/(q_i r) dr   for ALL basis functions j,
-    /// including the two endpoint functions at r=0 and r=r_max.
+    /// K_ij = 4π ∫ B_j(r) sin(q_i r)/(q_i r) dr   for the n_basis INTERIOR
+    /// basis functions (B_1 … B_{n_basis}).
     ///
-    /// Built via 5-point Gauss–Legendre quadrature per knot span.
-    /// The returned matrix has shape `(n_q × (n_free + 2))`.
-    /// The first and last columns (endpoint B-splines) are kept so that the
-    /// regulariser can penalise the slope at the boundaries; their coefficients
-    /// are pinned to zero by `append_boundary_constraints`.
+    /// The two endpoint columns (B_0 and B_{n_basis+1}) are dropped because
+    /// their coefficients are implicitly zero (P(0)=P(r_max)=0 by construction).
+    /// The returned matrix has shape `(n_q × n_basis)`.
     fn build_kernel_matrix(&self, q: &[f64]) -> DMatrix<f64> {
-        bspline::sinc_kernel_matrix(&self.knots, 3, q)
+        let full = bspline::sinc_kernel_matrix(&self.knots, 3, q);
+        let n_cols = full.ncols(); // n_basis + 2
+        let n_free = n_cols - 2;  // n_basis
+        DMatrix::from_fn(full.nrows(), n_free, |i, j| full[(i, j + 1)])
     }
 }
 
@@ -183,19 +172,12 @@ impl BasisSet for UniformGrid {
     }
 
     /// K_ij = 4π · sinc(q_i · r_j) · Δr   where sinc(x) = sin(x)/x.
-    ///
-    /// Boundary ghost columns (j = 0 and j = n_r − 1) return 0 because the
-    /// ghost bins have zero width and therefore contribute nothing to I(q).
     fn build_kernel_matrix(&self, q: &[f64]) -> DMatrix<f64> {
         let n_q = q.len();
         let n_r = self.r.len();
         let delta_r = self.delta_r;
-        let last = n_r - 1;
 
         DMatrix::from_fn(n_q, n_r, |i, j| {
-            if j == 0 || j == last {
-                return 0.0; // ghost boundary bin — zero kernel contribution
-            }
             let qr = q[i] * self.r[j];
             // sinc limit: sin(qr)/(qr) → 1 as qr → 0
             let sinc = if qr.abs() < 1e-10 {
@@ -216,44 +198,39 @@ impl BasisSet for UniformGrid {
 mod tests {
     use super::*;
 
-    /// n_basis free parameters → correct total dimensions (free + 2 boundary).
+    /// n_basis free parameters → correct kernel dimensions.
     #[test]
     fn cubic_bspline_dimensions() {
         let bs = CubicBSpline::new(150.0, 20);
-        // Total = n_free + 2 boundary endpoints
-        assert_eq!(bs.n_basis(), 22);
-        assert_eq!(bs.r_values().len(), 22);
+        // Interior only: n_basis = 20 (endpoint B-splines dropped)
+        assert_eq!(bs.n_basis(), 20);
+        assert_eq!(bs.r_values().len(), 20);
         assert_eq!(bs.r_max(), 150.0);
 
         let q: Vec<f64> = (1..=50).map(|i| i as f64 * 0.01).collect();
         let k = bs.build_kernel_matrix(&q);
         assert_eq!(k.nrows(), 50);
-        assert_eq!(k.ncols(), 22);
+        assert_eq!(k.ncols(), 20);
     }
 
-    /// r_values() now includes ALL Greville abscissae: the two endpoints at 0
-    /// and r_max (for the boundary basis functions) and the free interior ones
-    /// strictly between them.
+    /// r_values() returns interior Greville abscissae only (no endpoints at 0
+    /// or r_max), all strictly between 0 and r_max.
     #[test]
-    fn greville_endpoints_and_interior() {
+    fn greville_interior_only() {
         let r_max = 100.0_f64;
         let bs = CubicBSpline::new(r_max, 15);
         let r = bs.r_values();
-        // Total = 15 free + 2 boundary = 17
-        assert_eq!(r.len(), 17);
-        // First and last are the boundary abscissae
-        assert!((r[0] - 0.0).abs() < 1e-14, "first abscissa must be 0, got {}", r[0]);
-        assert!((r[r.len()-1] - r_max).abs() < 1e-14,
-            "last abscissa must be r_max, got {}", r[r.len()-1]);
-        // Interior ones are strictly between 0 and r_max
-        for &xi in &r[1..r.len()-1] {
+        // Interior only: 15 points
+        assert_eq!(r.len(), 15);
+        // All strictly inside (0, r_max) — endpoints are no longer included
+        for &xi in r {
             assert!(xi > 0.0 && xi < r_max,
-                "interior Greville abscissa {xi} not strictly inside (0, {r_max})");
+                "Greville abscissa {xi} not strictly inside (0, {r_max})");
         }
     }
 
-    /// At q = 0, K_ij = 4π ∫ B_j(r) dr.  All columns, including the endpoint
-    /// basis functions, should be positive (the sinc integrand is positive near q = 0).
+    /// At q = 0, K_ij = 4π ∫ B_j(r) dr for interior B-splines.
+    /// All interior B-splines have positive integrals.
     #[test]
     fn kernel_entries_positive_at_q0() {
         let bs = CubicBSpline::new(80.0, 12);

@@ -1,5 +1,4 @@
 [constraints]
-boundary_weight = 0
 d1_smoothness = 1
 
 [regularisation]

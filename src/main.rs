@@ -7,14 +7,14 @@ use std::path::PathBuf;
 use unfourier::{
     basis::{BasisSet, CubicBSpline, UniformGrid},
     data::{parse_dat, SaxsData},
-    kernel::{append_boundary_constraints, build_weighted_system},
+    kernel::build_weighted_system,
     lambda_select::{
         estimate_lambda_range, evaluate_lambda_grid, log_lambda_grid, posterior_sigma,
         BayesianEvidence, GcvSelector, GridMatrices, LCurveSelector, LambdaSelector,
     },
     output::{print_summary, write_fit_to_file, write_pr_to_file, write_pr_to_stdout},
     preprocess::{ClipNegative, LogRebin, OmitNonPositive, Preprocessor, QRangeSelector},
-    regularise::{CombinedDerivative, Regulariser, SecondDerivative},
+    regularise::{BoundaryAnchoredCombined, Regulariser},
     solver::{Solution, Solver, TikhonovSolver},
 };
 
@@ -175,22 +175,11 @@ fn run_solve(
     method: &Method,
     args: &Args,
     verbose: bool,
-    boundary_w: Option<f64>,
     ltl: nalgebra::DMatrix<f64>,
     reg: Box<dyn Regulariser>,
 ) -> Result<Solution> {
-    let (mut k_weighted, mut i_weighted) = build_weighted_system(basis, data);
+    let (k_weighted, i_weighted) = build_weighted_system(basis, data);
     let k_unweighted = basis.build_kernel_matrix(&data.q);
-
-    if let Some(w) = boundary_w {
-        append_boundary_constraints(&mut k_weighted, &mut i_weighted, w);
-        if verbose {
-            eprintln!(
-                "  [constraints] boundary P(0)=P(Dmax)=0  weight = {:.3e}",
-                w
-            );
-        }
-    }
 
     match method {
         Method::Manual => {
@@ -287,13 +276,9 @@ fn main() -> Result<()> {
     let mut args = Args::parse();
 
     // ---- 0. Load optional TOML config and fill unset CLI args ---------------
-    // boundary_multiplier: None = disabled (not recommended), Some(m) where m
-    // scales the auto weight.  Default Some(1.0) = always-on, because both bases
-    // now include boundary ghost coefficients that must be pinned to 0.
-    let mut boundary_multiplier: Option<f64> = Some(1.0);
-
-    // d1_weight: effective relative weight for the first-derivative penalty.
-    // None / -1 = SecondDerivative only (default). 0.0 = 1.0. positive = explicit.
+    // d1_weight: relative weight for the first-derivative penalty in the
+    // boundary-anchored combined regulariser.
+    // -1 = second-derivative curvature only (default). 0.0 = 1.0. positive = explicit.
     let mut d1_weight: f64 = 0.0;
     let mut use_d1 = false;
 
@@ -367,16 +352,6 @@ fn main() -> Result<()> {
         }
 
         // [constraints]
-        if let Some(bw) = cfg.constraints.boundary_weight {
-            if bw >= 0.0 {
-                // 0.0 → multiplier 1.0 (auto); positive → explicit multiplier
-                boundary_multiplier = Some(if bw == 0.0 { 1.0 } else { bw });
-                if args.verbose {
-                    eprintln!("  [config]   boundary_weight = {}", bw);
-                }
-            }
-            // bw < 0 (i.e. -1) → disabled; boundary_multiplier stays None
-        }
         if let Some(d1) = cfg.constraints.d1_smoothness {
             if d1 >= 0.0 {
                 use_d1 = true;
@@ -523,50 +498,60 @@ fn main() -> Result<()> {
 
     // ---- 4 + 5. Build system and solve -----------------------------------
 
-    // Compute boundary constraint weight (applies to both rect and spline).
-    // Both bases now include boundary ghost coefficients in the design matrix;
-    // these must be pinned to 0 for the boundary conditions to hold.
-    // w_default = sqrt(N) × rms(1/σ); multiplier scales it.
-    let boundary_w: Option<f64> = boundary_multiplier.map(|m| {
-        let rms_inv_sigma = (data
-            .error
-            .iter()
-            .map(|s| 1.0 / s / s)
-            .sum::<f64>()
-            / data.error.len() as f64)
-            .sqrt();
-        (data.len() as f64).sqrt() * rms_inv_sigma * m
-    });
-
-    // Build the regulariser (and its Gram matrix) once.
+    // Build the boundary-anchored regulariser once.
+    // BoundaryAnchoredCombined assumes c[-1]=c[n]=0 and penalises the slopes
+    // c[0] and c[n-1] (boundary-adjacent bins) from/to those fixed zeros.
+    // This eliminates the competition between soft boundary constraints and the
+    // regulariser that plagued the old ghost-coefficient approach.
     let n_basis = basis.r_values().len();
     let reg: Box<dyn Regulariser> = if use_d1 {
         if args.verbose {
             eprintln!(
-                "  [constraints] regulariser: combined  d1={:.2}  d2=1.00",
+                "  [constraints] regulariser: boundary-anchored-combined  d1={:.2}  d2=1.00",
                 d1_weight
             );
         }
-        Box::new(CombinedDerivative { d1_weight, d2_weight: 1.0 })
+        Box::new(BoundaryAnchoredCombined { d1_weight, d2_weight: 1.0 })
     } else {
-        Box::new(SecondDerivative)
+        Box::new(BoundaryAnchoredCombined { d1_weight: 0.0, d2_weight: 1.0 })
     };
     let ltl = reg.gram_matrix(n_basis);
 
-    let solution = run_solve(
+    let mut solution = run_solve(
         &data,
         basis.as_ref(),
         &method,
         &args,
         args.verbose,
-        boundary_w,
         ltl,
         reg,
     )?;
 
-    // Both bases now include r=0 and r=r_max in r_values() (as boundary ghost
-    // points or endpoint B-splines), so the boundary values appear in the output
-    // naturally — no post-hoc insertion needed.
+    // ---- Hard boundary conditions: P(r=0) = P(r=D_max) = 0 ----------------
+    // Post-hoc insert explicit boundary rows and project boundary-adjacent
+    // interior coefficients to zero.
+    //
+    // Value condition: prepend (r=0, P=0) and append (r=r_max, P=0).
+    solution.r.insert(0, 0.0);
+    solution.p_r.insert(0, 0.0);
+    solution.r.push(r_max);
+    solution.p_r.push(0.0);
+    if let Some(ref mut err) = solution.p_r_err {
+        err.insert(0, 0.0);
+        err.push(0.0);
+    }
+
+    // Slope condition: zero out the first and last INTERIOR bins.
+    // For splines: P'(0) ∝ c[1] (clamped B-spline derivative formula) → exact zero.
+    // For rect: P(Δr/2) = 0 (first/last interior bin forced to zero).
+    // Both are at indices 1 and last-1 after the boundary insertion above.
+    let last = solution.p_r.len() - 1;
+    solution.p_r[1] = 0.0;
+    solution.p_r[last - 1] = 0.0;
+    if let Some(ref mut err) = solution.p_r_err {
+        err[1] = 0.0;
+        err[last - 1] = 0.0;
+    }
 
     if args.verbose {
         if let Some(lam_eff) = solution.lambda_effective {

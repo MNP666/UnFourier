@@ -147,6 +147,96 @@ impl Regulariser for SecondDerivative {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Boundary-anchored derivatives
+// ---------------------------------------------------------------------------
+
+/// First-derivative matrix anchored to zero boundary conditions (n+1) × n.
+///
+/// The first and last rows penalise the slope from/to the implicit zero
+/// boundaries (c[-1] = 0 at the left, c[n] = 0 at the right):
+///
+/// ```text
+///   Row 0:   [ 1,  0, …,  0]  ← c[0]−0    = c[0]    (left boundary slope)
+///   Row k:   [−1,  1, 0, …]   ← c[k]−c[k−1]
+///   Row n:   [ 0, …, 0, −1]   ← 0−c[n−1] = −c[n−1]  (right boundary slope)
+/// ```
+fn ba_d1_matrix(n: usize) -> DMatrix<f64> {
+    assert!(n >= 1, "ba_d1_matrix requires at least 1 interior coefficient");
+    DMatrix::from_fn(n + 1, n, |i, j| {
+        if i == 0 {
+            if j == 0 { 1.0 } else { 0.0 }
+        } else if i == n {
+            if j == n - 1 { -1.0 } else { 0.0 }
+        } else {
+            // Interior row: difference c[i] − c[i−1]
+            if j + 1 == i { -1.0 } else if j == i { 1.0 } else { 0.0 }
+        }
+    })
+}
+
+/// Second-derivative matrix anchored to zero boundary conditions, n × n.
+///
+/// Rows include the implicit zero boundary values (c[-1]=0, c[n]=0):
+///
+/// ```text
+///   Row 0:   [−2, 1, 0, …]  ← 0−2c[0]+c[1]
+///   Row k:   […, 1, −2, 1, …]  ← c[k−1]−2c[k]+c[k+1]
+///   Row n−1: [0, …, 1, −2]  ← c[n−2]−2c[n−1]+0
+/// ```
+fn ba_d2_matrix(n: usize) -> DMatrix<f64> {
+    assert!(n >= 1, "ba_d2_matrix requires at least 1 interior coefficient");
+    DMatrix::from_fn(n, n, |i, j| {
+        if j == i {
+            -2.0
+        } else if j == i + 1 || (i > 0 && j + 1 == i) {
+            1.0
+        } else {
+            0.0
+        }
+    })
+}
+
+/// Combined slope + curvature penalty with zero boundary anchoring.
+///
+/// `‖L·c‖² = d₁·‖D̃₁·c‖² + d₂·‖D̃₂·c‖²`
+///
+/// where D̃₁ (n+1 × n) and D̃₂ (n × n) are the boundary-anchored first- and
+/// second-derivative matrices.  They include the slope from/to the implicit
+/// zero boundary values, which eliminates the competition between soft
+/// boundary constraints and the regulariser.
+///
+/// When `d1_weight = 0.0` (the default), the combined matrix reduces to
+/// `D̃₂` alone (boundary-anchored curvature only).
+pub struct BoundaryAnchoredCombined {
+    pub d1_weight: f64,
+    pub d2_weight: f64,
+}
+
+impl Regulariser for BoundaryAnchoredCombined {
+    fn name(&self) -> &str {
+        "boundary-anchored-combined"
+    }
+
+    fn matrix(&self, n_basis: usize) -> DMatrix<f64> {
+        let d2 = ba_d2_matrix(n_basis);
+        let sqrt_d2 = self.d2_weight.sqrt();
+        if self.d1_weight == 0.0 {
+            return d2 * sqrt_d2;
+        }
+        let d1 = ba_d1_matrix(n_basis);
+        let nrows = d1.nrows() + d2.nrows(); // (n+1) + n = 2n+1
+        let sqrt_d1 = self.d1_weight.sqrt();
+        DMatrix::from_fn(nrows, n_basis, |i, j| {
+            if i < d1.nrows() {
+                d1[(i, j)] * sqrt_d1
+            } else {
+                d2[(i - d1.nrows(), j)] * sqrt_d2
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +281,85 @@ mod tests {
             trace_combined > trace_second,
             "trace_combined={} should exceed trace_second={}",
             trace_combined, trace_second
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Boundary-anchored helpers
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ba_d1_shape_and_boundary_rows() {
+        let n = 3;
+        let d = ba_d1_matrix(n);
+        assert_eq!(d.nrows(), n + 1); // 4
+        assert_eq!(d.ncols(), n);     // 3
+
+        // Row 0: [1, 0, 0]
+        assert_eq!(d[(0, 0)],  1.0);
+        assert_eq!(d[(0, 1)],  0.0);
+
+        // Row 1: [-1, 1, 0]
+        assert_eq!(d[(1, 0)], -1.0);
+        assert_eq!(d[(1, 1)],  1.0);
+        assert_eq!(d[(1, 2)],  0.0);
+
+        // Row 3 (last): [0, 0, -1]
+        assert_eq!(d[(3, 1)],  0.0);
+        assert_eq!(d[(3, 2)], -1.0);
+    }
+
+    #[test]
+    fn ba_d2_shape_and_boundary_rows() {
+        let n = 3;
+        let d = ba_d2_matrix(n);
+        assert_eq!(d.nrows(), n); // 3
+        assert_eq!(d.ncols(), n); // 3
+
+        // Row 0: [-2, 1, 0]
+        assert_eq!(d[(0, 0)], -2.0);
+        assert_eq!(d[(0, 1)],  1.0);
+        assert_eq!(d[(0, 2)],  0.0);
+
+        // Row 1: [1, -2, 1]
+        assert_eq!(d[(1, 0)],  1.0);
+        assert_eq!(d[(1, 1)], -2.0);
+        assert_eq!(d[(1, 2)],  1.0);
+
+        // Row 2 (last): [0, 1, -2]
+        assert_eq!(d[(2, 0)],  0.0);
+        assert_eq!(d[(2, 1)],  1.0);
+        assert_eq!(d[(2, 2)], -2.0);
+    }
+
+    #[test]
+    fn ba_combined_d1_zero_reduces_to_ba_d2_gram() {
+        let n = 5;
+        let combined = BoundaryAnchoredCombined { d1_weight: 0.0, d2_weight: 1.0 };
+        let ltl_combined = combined.gram_matrix(n);
+        // Should equal ba_d2_matrix(n)^T * ba_d2_matrix(n)
+        let d2 = ba_d2_matrix(n);
+        let ltl_d2 = d2.transpose() * &d2;
+        for i in 0..n {
+            for j in 0..n {
+                let diff = (ltl_combined[(i, j)] - ltl_d2[(i, j)]).abs();
+                assert!(
+                    diff < 1e-12,
+                    "ltl_combined[{i},{j}]={} != ltl_d2[{i},{j}]={}",
+                    ltl_combined[(i, j)], ltl_d2[(i, j)]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ba_combined_d1_adds_to_trace() {
+        let n = 8;
+        let d2_only = BoundaryAnchoredCombined { d1_weight: 0.0, d2_weight: 1.0 };
+        let combined = BoundaryAnchoredCombined { d1_weight: 1.0, d2_weight: 1.0 };
+        assert!(
+            combined.gram_matrix(n).trace() > d2_only.gram_matrix(n).trace(),
+            "adding d1 weight must increase trace"
         );
     }
 }
