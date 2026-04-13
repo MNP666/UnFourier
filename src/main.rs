@@ -1,18 +1,18 @@
 mod config;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 
 use unfourier::{
     basis::{BasisSet, CubicBSpline},
-    data::{SaxsData, parse_dat},
+    data::{parse_dat, SaxsData},
     kernel::build_weighted_system,
     lambda_select::{
+        estimate_lambda_range, evaluate_lambda_grid, log_lambda_grid, posterior_coeff_sigma,
         BayesianEvidence, GcvSelector, GridMatrices, LCurveSelector, LambdaSelector,
-        estimate_lambda_range, evaluate_lambda_grid, log_lambda_grid, posterior_sigma,
     },
-    output::{print_summary, write_fit_to_file, write_pr_to_file, write_pr_to_stdout},
+    output::{print_summary, write_fit_to_file, write_pr_to_file, write_pr_to_stdout, PrCurve},
     preprocess::{ClipNegative, LogRebin, OmitNonPositive, Preprocessor, QRangeSelector},
     regularise::{BoundaryAnchoredCombined, Regulariser},
     solver::{Solution, Solver, TikhonovSolver},
@@ -173,7 +173,6 @@ fn run_solve(
                 &k_unweighted,
                 &data.intensity,
                 &data.error,
-                basis.r_values(),
             )
         }
 
@@ -184,7 +183,6 @@ fn run_solve(
                 &k_unweighted,
                 &data.intensity,
                 &data.error,
-                basis.r_values(),
                 ltl,
             );
 
@@ -238,7 +236,7 @@ fn run_solve(
             let mut solution = best.solution.clone();
 
             if matches!(method, Method::Bayes) {
-                solution.p_r_err = Some(posterior_sigma(&matrices, best.lambda_eff)?);
+                solution.coeff_err = Some(posterior_coeff_sigma(&matrices, best.lambda_eff)?);
             }
 
             Ok(solution)
@@ -483,33 +481,22 @@ fn main() -> Result<()> {
     };
     let ltl = reg.gram_matrix(n_basis);
 
-    let mut solution = run_solve(&data, &basis, &method, &args, args.verbose, ltl, reg)?;
+    let solution = run_solve(&data, &basis, &method, &args, args.verbose, ltl, reg)?;
 
-    // ---- Hard boundary conditions: P(r=0) = P(r=D_max) = 0 ----------------
-    // Post-hoc insert explicit boundary rows and project boundary-adjacent
-    // interior coefficients to zero.
-    //
-    // Value condition: prepend (r=0, P=0) and append (r=r_max, P=0).
-    solution.r.insert(0, 0.0);
-    solution.p_r.insert(0, 0.0);
-    solution.r.push(r_max);
-    solution.p_r.push(0.0);
-    if let Some(ref mut err) = solution.p_r_err {
-        err.insert(0, 0.0);
-        err.push(0.0);
-    }
-
-    // Slope condition: zero out the first and last INTERIOR bins.
-    // For splines: P'(0) ∝ c[1] (clamped B-spline derivative formula) → exact zero.
-    // Both boundary-adjacent coefficients are at indices 1 and last-1 after the
-    // boundary insertion above.
-    let last = solution.p_r.len() - 1;
-    solution.p_r[1] = 0.0;
-    solution.p_r[last - 1] = 0.0;
-    if let Some(ref mut err) = solution.p_r_err {
-        err[1] = 0.0;
-        err[last - 1] = 0.0;
-    }
+    // ---- Evaluate spline output ------------------------------------------
+    // The solver returns spline coefficients.  The published P(r) table is the
+    // evaluated spline function on a dense output grid, including the endpoints.
+    let output_r = basis.output_grid();
+    let output_p = basis.evaluate_pr(&solution.coeffs, &output_r);
+    let output_err = solution
+        .coeff_err
+        .as_ref()
+        .map(|coeff_sigma| basis.evaluate_pr_sigma(coeff_sigma, &output_r));
+    let pr_curve = PrCurve {
+        r: output_r,
+        p_r: output_p,
+        p_r_err: output_err,
+    };
 
     if args.verbose {
         if let Some(lam_eff) = solution.lambda_effective {
@@ -518,18 +505,18 @@ fn main() -> Result<()> {
                 lam_eff
             );
         }
-        print_summary(&solution);
+        print_summary(&solution, &pr_curve);
     }
 
     // ---- 6. Output -------------------------------------------------------
     match &args.output {
         Some(path) => {
-            write_pr_to_file(path, &solution)?;
+            write_pr_to_file(path, &pr_curve)?;
             if args.verbose {
                 eprintln!("P(r) written to '{}'", path.display());
             }
         }
-        None => write_pr_to_stdout(&solution)?,
+        None => write_pr_to_stdout(&pr_curve)?,
     }
 
     if let Some(fit_path) = &args.fit_output {

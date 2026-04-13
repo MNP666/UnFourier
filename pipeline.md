@@ -158,8 +158,8 @@ clamped knot vector contains endpoint B-splines that are non-zero at r = 0 and
 r = D_max; the active `CubicBSpline` implementation drops those endpoint columns
 from the kernel, so no free coefficient can make P(0) or P(D_max) non-zero.
 
-M8 is tightening this further by removing post-hoc output mutation and replacing
-raw coefficient output with evaluated spline samples.
+M8 Epic 2 removes post-hoc output mutation: the solver returns coefficients,
+and the output stage evaluates those coefficients on a dense spline grid.
 
 ---
 
@@ -402,10 +402,12 @@ A value close to 1.0 indicates the fit is consistent with the measurement
 uncertainties.  Values significantly below 1 suggest over-fitting (λ too
 small); values significantly above 1 suggest over-smoothing (λ too large).
 
-**Spline boundary rows.** The spline basis structurally enforces P(0) = P(D_max)
-= 0, but the interior Greville abscissae returned by `r_values()` do not include
-the boundary points.  The output stage appends explicit rows `(0, 0)` and
-`(D_max, 0)` so the written curve visibly reaches zero at both ends.
+**Spline output evaluation.** The spline basis structurally enforces P(0) =
+P(D_max) = 0 by dropping the endpoint columns from the free basis.  The interior
+Greville abscissae returned by `r_values()` are coefficient diagnostics, not the
+published P(r) grid.  The output stage now asks the basis for a dense grid and
+evaluates the spline expansion on it, so endpoint zeros come from the basis
+parameterisation rather than appended rows.
 
 ### Output files
 

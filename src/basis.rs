@@ -18,7 +18,11 @@ use nalgebra::DMatrix;
 ///
 /// - `CubicBSpline`: compact-support splines for a smooth representation
 pub trait BasisSet: Send + Sync {
-    /// The r-values at which the basis is centred (one per coefficient).
+    /// Representative r-values for the free coefficients.
+    ///
+    /// For splines these are Greville abscissae of the free interior basis
+    /// functions. They are useful diagnostics, but they are not sampled P(r)
+    /// output positions.
     fn r_values(&self) -> &[f64];
 
     /// Upper bound of the support of P(r).
@@ -33,6 +37,19 @@ pub trait BasisSet: Send + Sync {
     ///
     /// K_ij = contribution of basis function j to I(q_i).
     fn build_kernel_matrix(&self, q: &[f64]) -> DMatrix<f64>;
+
+    /// Dense r-grid used when writing or plotting the evaluated P(r) curve.
+    fn output_grid(&self) -> Vec<f64>;
+
+    /// Evaluate P(r) = Σ_j c_j φ_j(r) on the supplied r-grid.
+    fn evaluate_pr(&self, coeffs: &[f64], r: &[f64]) -> Vec<f64>;
+
+    /// Propagate marginal coefficient standard deviations to the output grid.
+    ///
+    /// This assumes independent coefficient marginals because the current M4
+    /// posterior helper exposes only diagonal standard deviations. It is still
+    /// preferable to writing raw coefficient σ values on a denser output grid.
+    fn evaluate_pr_sigma(&self, coeff_sigma: &[f64], r: &[f64]) -> Vec<f64>;
 }
 
 // ---------------------------------------------------------------------------
@@ -50,10 +67,9 @@ pub trait BasisSet: Send + Sync {
 /// P(r) = Σ_{j=1}^{n_basis}  c_j · B_j(r)   (B_0 and B_{n+1} dropped)
 /// ```
 ///
-/// Boundary conditions P(0)=P'(0)=P(r_max)=P'(r_max)=0 are ensured by the
-/// boundary-anchored regulariser (which penalises slopes from/to the implicit
-/// zero boundary) together with a post-solve hard projection of the
-/// boundary-adjacent coefficients to zero.
+/// Endpoint values P(0)=P(r_max)=0 are enforced by the parameterisation.  The
+/// solved coefficients are spline control weights, not sampled P(r) values;
+/// output must be produced with [`BasisSet::evaluate_pr`].
 ///
 /// # Parameters
 ///
@@ -96,6 +112,14 @@ impl CubicBSpline {
             r_max,
         }
     }
+
+    /// Basis matrix for the free interior spline coefficients only.
+    fn free_basis_matrix(&self, r: &[f64]) -> DMatrix<f64> {
+        let full = bspline::basis_matrix(&self.knots, 3, r);
+        let n_cols = full.ncols();
+        let n_free = n_cols - 2;
+        DMatrix::from_fn(full.nrows(), n_free, |i, j| full[(i, j + 1)])
+    }
 }
 
 impl BasisSet for CubicBSpline {
@@ -118,6 +142,46 @@ impl BasisSet for CubicBSpline {
         let n_cols = full.ncols(); // n_basis + 2
         let n_free = n_cols - 2; // n_basis
         DMatrix::from_fn(full.nrows(), n_free, |i, j| full[(i, j + 1)])
+    }
+
+    fn output_grid(&self) -> Vec<f64> {
+        let n_intervals = (self.r_interior.len() * 10).max(200);
+        (0..=n_intervals)
+            .map(|i| self.r_max * i as f64 / n_intervals as f64)
+            .collect()
+    }
+
+    fn evaluate_pr(&self, coeffs: &[f64], r: &[f64]) -> Vec<f64> {
+        let b = self.free_basis_matrix(r);
+        assert_eq!(
+            coeffs.len(),
+            b.ncols(),
+            "coefficient count must match the free spline basis"
+        );
+
+        let c = nalgebra::DVector::from_column_slice(coeffs);
+        (b * c).iter().cloned().collect()
+    }
+
+    fn evaluate_pr_sigma(&self, coeff_sigma: &[f64], r: &[f64]) -> Vec<f64> {
+        let b = self.free_basis_matrix(r);
+        assert_eq!(
+            coeff_sigma.len(),
+            b.ncols(),
+            "coefficient sigma count must match the free spline basis"
+        );
+
+        (0..b.nrows())
+            .map(|i| {
+                (0..b.ncols())
+                    .map(|j| {
+                        let term = b[(i, j)] * coeff_sigma[j];
+                        term * term
+                    })
+                    .sum::<f64>()
+                    .sqrt()
+            })
+            .collect()
     }
 }
 
@@ -175,5 +239,54 @@ mod tests {
                 k[(0, j)]
             );
         }
+    }
+
+    #[test]
+    fn output_grid_is_dense_and_includes_endpoints() {
+        let bs = CubicBSpline::new(100.0, 12);
+        let grid = bs.output_grid();
+
+        assert_ne!(
+            grid.len(),
+            bs.n_basis(),
+            "output grid must not be the raw coefficient grid"
+        );
+        assert!(grid.len() > bs.n_basis());
+        assert_eq!(grid.first().copied(), Some(0.0));
+        assert_eq!(grid.last().copied(), Some(100.0));
+    }
+
+    #[test]
+    fn evaluated_output_endpoints_are_zero_without_mutating_coeffs() {
+        let bs = CubicBSpline::new(100.0, 8);
+        let coeffs: Vec<f64> = (1..=8).map(|i| i as f64).collect();
+        let original = coeffs.clone();
+        let r = bs.output_grid();
+        let p = bs.evaluate_pr(&coeffs, &r);
+
+        assert_eq!(coeffs, original, "evaluation must not mutate coefficients");
+        assert_eq!(p.len(), r.len());
+        assert!(p[0].abs() < 1e-12, "P(0) must be exactly zero");
+        assert!(p[p.len() - 1].abs() < 1e-12, "P(Dmax) must be exactly zero");
+        assert!(
+            p.iter().any(|&v| v > 0.0),
+            "non-zero coefficients should produce non-zero interior P(r)"
+        );
+    }
+
+    #[test]
+    fn output_evaluation_does_not_change_back_calculated_intensity() {
+        use crate::kernel::back_calculate;
+
+        let bs = CubicBSpline::new(120.0, 10);
+        let coeffs: Vec<f64> = (0..10).map(|i| 0.2 + i as f64 * 0.1).collect();
+        let q = vec![0.01, 0.04, 0.08, 0.12];
+
+        let before = back_calculate(&bs, &q, &coeffs);
+        let r = bs.output_grid();
+        let _p = bs.evaluate_pr(&coeffs, &r);
+        let after = back_calculate(&bs, &q, &coeffs);
+
+        assert_eq!(before, after);
     }
 }

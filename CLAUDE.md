@@ -47,7 +47,7 @@ python Dev/monte_carlo_coverage.py --n 200 --k 5
 
 ## Architecture
 
-The pipeline in `main.rs` is: **parse → preprocess → r-grid → build kernel → solve → boundary projection → output**.
+The pipeline in `main.rs` is: **parse → preprocess → r-grid → build kernel → solve coefficients → evaluate spline P(r) → output**.
 
 Each stage is abstracted behind a trait, making the system extensible without modifying the pipeline:
 
@@ -86,22 +86,22 @@ Each stage is abstracted behind a trait, making the system extensible without mo
 
 ## Open Issue: M8 — Smooth boundary conditions
 
-**Problem:** P(r) at r=0 and r=D_max should go smoothly to zero. The current approach cannot achieve this:
+**Problem:** P(r) at r=0 and r=D_max should go smoothly to zero. Earlier M8 work could not achieve this:
 
 - **Without hard zeroing:** The interior bins adjacent to the boundary take non-zero values — P(r) is non-zero at the edges.
 - **With hard zeroing** (post-hoc zero-clamp of first/last interior bin): P(r) hits zero at the boundary point but is discontinuous — the interior bins just inside are finite, so the curve steps to zero rather than sloping to zero.
 
-**Current approach (not fully solving the problem):**
-1. `BoundaryAnchoredCombined` regulariser: penalises the slope of c[0] from/to the implicit zero boundary (c[-1]=0, c[n]=0), intended to discourage non-zero boundary-adjacent values via smooth regularisation pressure.
-2. Post-hoc insertion of explicit (r=0, P=0) and (r=D_max, P=0) rows in the output.
-3. Hard zero-clamp of the first and last interior coefficient after solve (`p_r[1] = 0.0`, `p_r[last-1] = 0.0` in `main.rs:549–550`).
+**Current approach after Epic 2:**
+1. `Solution` stores solved spline coefficients as `coeffs`, not sampled `P(r)`.
+2. `CubicBSpline::output_grid()` creates a dense output grid including `r=0` and `r=D_max`.
+3. `CubicBSpline::evaluate_pr()` evaluates the spline expansion for output; no post-solve coefficient clamp is applied.
 
-**Root cause:** The cubic B-spline basis can enforce exact zero endpoint values, but the current output path still mutates solved values post-hoc. Zeroing interior coefficients after solving creates a visible discontinuity one sample inward from the boundary and makes the written P(r) inconsistent with the coefficients used for I(q).
+**Remaining root cause:** The cubic B-spline basis enforces exact zero endpoint values, but optional derivative-zero boundary modes and projected regularisation are still future Epic 3/4 work. Smoothness near the boundaries is currently controlled by the spline basis and boundary-anchored regularisation rather than a full coefficient-mapping model.
 
 **Candidate approaches still to explore:**
-- For splines: verify that dropping the endpoint B-splines (as currently done in `CubicBSpline`) truly forces P(0)=P(D_max)=0 exactly — and whether optional derivative constraints should be exposed.
-- Add explicit boundary constraint rows to the design matrix (augmented least-squares) rather than a post-hoc clamp.
-- Evaluate the spline expansion for output instead of writing raw coefficients or post-hoc edited values.
+- For splines: add `value_zero` / `value_slope_zero` boundary modes through an explicit free-to-full coefficient mapping.
+- Project the kernel and regulariser through that mapping so kernel, regulariser, and output evaluation all agree.
+- Revisit Bayesian P(r) error propagation once full posterior covariance output is needed on the dense grid.
 
 ## Validation Notes
 

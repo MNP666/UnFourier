@@ -86,8 +86,8 @@ const GCV_FLAT_THRESHOLD: f64 = 0.10;
 ///
 /// Storing everything here (rather than just the score) means the caller can
 /// inspect diagnostics and plot the full L-curve without re-running solves.
-/// The `solution` field contains the non-negativity-enforced P(r) — this is
-/// what gets used if this λ is selected.
+/// The `solution` field contains the non-negativity-enforced coefficient
+/// vector — this is what gets used if this λ is selected.
 #[derive(Debug, Clone)]
 pub struct LambdaEvaluation {
     /// User-facing λ (before internal trace-ratio scaling).
@@ -118,7 +118,7 @@ pub struct LambdaEvaluation {
     /// Reduced χ² from the non-negativity-enforced solution (for display).
     pub chi_squared: f64,
 
-    /// The non-negativity-enforced P(r) solution (ready to use if λ selected).
+    /// The non-negativity-enforced coefficient solution.
     pub solution: Solution,
 }
 
@@ -303,11 +303,7 @@ impl LambdaSelector for BayesianEvidence {
             .iter()
             .enumerate()
             .filter(|(_, e)| e.log_evidence.is_finite())
-            .max_by(|(_, a), (_, b)| {
-                a.log_evidence
-                    .partial_cmp(&b.log_evidence)
-                    .unwrap()
-            })
+            .max_by(|(_, a), (_, b)| a.log_evidence.partial_cmp(&b.log_evidence).unwrap())
             .map(|(i, _)| i)
             .unwrap_or(0)
     }
@@ -346,9 +342,6 @@ pub struct GridMatrices {
 
     /// tr(KᵀK) / tr(LᵀL) — used to scale λ internally
     pub trace_ratio: f64,
-
-    /// r-grid values from the BasisSet
-    pub r: Vec<f64>,
 }
 
 impl GridMatrices {
@@ -360,7 +353,6 @@ impl GridMatrices {
     /// - `k_unweighted` — K                  (n_q × n_r)
     /// - `i_observed`   — raw I(q)            (n_q)
     /// - `sigma`        — measurement errors  (n_q)
-    /// - `r`            — r-grid values        (n_r)
     /// - `ltl`          — precomputed LᵀL Gram matrix (n_r × n_r)
     pub fn build(
         k_weighted: &DMatrix<f64>,
@@ -368,7 +360,6 @@ impl GridMatrices {
         k_unweighted: &DMatrix<f64>,
         i_observed: &[f64],
         sigma: &[f64],
-        r: &[f64],
         ltl: DMatrix<f64>,
     ) -> Self {
         let ktk = k_weighted.transpose() * k_weighted;
@@ -389,7 +380,6 @@ impl GridMatrices {
             sigma: sigma.to_vec(),
             i_w_norm_sq,
             trace_ratio,
-            r: r.to_vec(),
         }
     }
 }
@@ -404,7 +394,8 @@ impl GridMatrices {
 /// 1. Compute λ_eff = λ · trace_ratio.
 /// 2. Solve the unconstrained Tikhonov system (for GCV / L-curve quantities).
 /// 3. Compute RSS_w, solution_norm, df, and GCV score from the unconstrained c.
-/// 4. Apply non-negativity (iterative clipping) to get the final P(r).
+/// 4. Apply non-negativity (projected-gradient NNLS) to get the final
+///    coefficient vector.
 /// 5. Compute χ² from the non-negativity-enforced solution (for display).
 ///
 /// The unconstrained solve is used for λ selection because GCV and the L-curve
@@ -414,12 +405,9 @@ impl GridMatrices {
 ///
 /// Each evaluation is fully independent — this loop is a natural candidate for
 /// `rayon::par_iter()` when parallelism is added in a future milestone.
-pub fn evaluate_lambda_grid(
-    lambdas: &[f64],
-    m: &GridMatrices,
-) -> Result<Vec<LambdaEvaluation>> {
+pub fn evaluate_lambda_grid(lambdas: &[f64], m: &GridMatrices) -> Result<Vec<LambdaEvaluation>> {
     let n_q = m.i_observed.len();
-    let n_r = m.r.len();
+    let n_r = m.ktk.ncols();
 
     let mut evaluations = Vec::with_capacity(lambdas.len());
 
@@ -459,13 +447,7 @@ pub fn evaluate_lambda_grid(
         // log det(A + λ_eff H) = 2 Σ_i log L_{ii}  where  mat = L Lᵀ (Cholesky).
         // All diagonal elements of L are positive by construction.
         let log_evidence = {
-            let log_det_a = 2.0
-                * chol
-                    .l()
-                    .diagonal()
-                    .iter()
-                    .map(|&x| x.ln())
-                    .sum::<f64>();
+            let log_det_a = 2.0 * chol.l().diagonal().iter().map(|&x| x.ln()).sum::<f64>();
             -0.5 * (rss_weighted + lambda_eff * solution_norm + log_det_a
                 - n_r as f64 * lambda_eff.ln())
         };
@@ -497,11 +479,11 @@ pub fn evaluate_lambda_grid(
 
         // ---- constrained solve (non-negativity, for final P(r)) ----
         // Warm-start from the unconstrained solution already computed above.
-        let p_r = projected_gradient_nnls(&mat, &m.kti, &c_unconstrained, 500, 1e-8);
+        let coeffs = projected_gradient_nnls(&mat, &m.kti, &c_unconstrained, 500, 1e-8);
 
         // Back-calculate I(q) and χ² from constrained solution
-        let coeffs = DVector::from_column_slice(&p_r);
-        let i_calc: Vec<f64> = (&m.k_unweighted * &coeffs).iter().cloned().collect();
+        let coeff_vec = DVector::from_column_slice(&coeffs);
+        let i_calc: Vec<f64> = (&m.k_unweighted * &coeff_vec).iter().cloned().collect();
         let chi_squared = reduced_chi_squared(&m.i_observed, &i_calc, &m.sigma);
 
         evaluations.push(LambdaEvaluation {
@@ -514,9 +496,8 @@ pub fn evaluate_lambda_grid(
             log_evidence,
             chi_squared,
             solution: Solution {
-                r: m.r.clone(),
-                p_r,
-                p_r_err: None,
+                coeffs,
+                coeff_err: None,
                 i_calc,
                 chi_squared,
                 lambda_effective: Some(lambda_eff),
@@ -531,7 +512,7 @@ pub fn evaluate_lambda_grid(
 // Posterior covariance
 // ---------------------------------------------------------------------------
 
-/// Compute the marginal posterior standard deviations of the P(r) coefficients.
+/// Compute marginal posterior standard deviations of the solved coefficients.
 ///
 /// For the weighted Tikhonov problem the posterior covariance is:
 ///
@@ -550,8 +531,8 @@ pub fn evaluate_lambda_grid(
 ///
 /// Note: `lambda_eff` must be the *effective* (scaled) λ stored in
 /// [`LambdaEvaluation::lambda_eff`], not the user-facing λ.
-pub fn posterior_sigma(m: &GridMatrices, lambda_eff: f64) -> Result<Vec<f64>> {
-    let n_r = m.r.len();
+pub fn posterior_coeff_sigma(m: &GridMatrices, lambda_eff: f64) -> Result<Vec<f64>> {
+    let n_r = m.ktk.ncols();
     let mat = &m.ktk + &m.ltl * lambda_eff;
 
     let chol = mat.cholesky().ok_or_else(|| {
@@ -567,8 +548,10 @@ pub fn posterior_sigma(m: &GridMatrices, lambda_eff: f64) -> Result<Vec<f64>> {
     let sigma_mat = chol.solve(&identity);
 
     // Marginal std dev for each coefficient: sqrt(Σ_{jj})
-    let p_r_sigma: Vec<f64> = (0..n_r).map(|j| sigma_mat[(j, j)].max(0.0).sqrt()).collect();
-    Ok(p_r_sigma)
+    let coeff_sigma: Vec<f64> = (0..n_r)
+        .map(|j| sigma_mat[(j, j)].max(0.0).sqrt())
+        .collect();
+    Ok(coeff_sigma)
 }
 
 // ---------------------------------------------------------------------------
@@ -654,9 +637,8 @@ mod tests {
             log_evidence: 0.0,
             chi_squared: 1.0,
             solution: Solution {
-                r: vec![],
-                p_r: vec![],
-                p_r_err: None,
+                coeffs: vec![],
+                coeff_err: None,
                 i_calc: vec![],
                 chi_squared: 1.0,
                 lambda_effective: Some(1.0),
@@ -683,9 +665,8 @@ mod tests {
             log_evidence: 0.0,
             chi_squared: 1.0,
             solution: Solution {
-                r: vec![],
-                p_r: vec![],
-                p_r_err: None,
+                coeffs: vec![],
+                coeff_err: None,
                 i_calc: vec![],
                 chi_squared: 1.0,
                 lambda_effective: Some(1.0),
@@ -730,9 +711,8 @@ mod tests {
             log_evidence: 0.0,
             chi_squared: 1.0,
             solution: Solution {
-                r: vec![],
-                p_r: vec![],
-                p_r_err: None,
+                coeffs: vec![],
+                coeff_err: None,
                 i_calc: vec![],
                 chi_squared: 1.0,
                 lambda_effective: Some(1.0),
@@ -754,19 +734,18 @@ mod tests {
             x.sin() / x
         });
         let i_w: Vec<f64> = (1..=n_q).map(|i| (i as f64) * 0.05).collect();
-        let r: Vec<f64> = (1..=n_r).map(|i| i as f64 * 10.0).collect();
         use crate::regularise::Regulariser as _;
         let ltl = crate::regularise::SecondDerivative.gram_matrix(n_r);
-        GridMatrices::build(&k_w, &i_w, &k_w.clone(), &i_w, &vec![1.0; n_q], &r, ltl)
+        GridMatrices::build(&k_w, &i_w, &k_w.clone(), &i_w, &vec![1.0; n_q], ltl)
     }
 
     #[test]
-    fn posterior_sigma_shape_and_sign() {
+    fn posterior_coeff_sigma_shape_and_sign() {
         let m = make_test_matrices();
         let lambda_eff = 1e6_f64; // large enough for Cholesky to be well-conditioned
-        let sigma = posterior_sigma(&m, lambda_eff).unwrap();
+        let sigma = posterior_coeff_sigma(&m, lambda_eff).unwrap();
 
-        assert_eq!(sigma.len(), m.r.len(), "sigma length must match n_r");
+        assert_eq!(sigma.len(), m.ktk.ncols(), "sigma length must match n_r");
         assert!(
             sigma.iter().all(|&s| s > 0.0 && s.is_finite()),
             "all sigma values must be positive and finite"
@@ -774,11 +753,11 @@ mod tests {
     }
 
     #[test]
-    fn posterior_sigma_shrinks_with_lambda() {
+    fn posterior_coeff_sigma_shrinks_with_lambda() {
         // Larger λ → prior dominates → tighter posterior → smaller σ.
         let m = make_test_matrices();
-        let sigma_small = posterior_sigma(&m, 1e4).unwrap();
-        let sigma_large = posterior_sigma(&m, 1e8).unwrap();
+        let sigma_small = posterior_coeff_sigma(&m, 1e4).unwrap();
+        let sigma_large = posterior_coeff_sigma(&m, 1e8).unwrap();
 
         let sum_small: f64 = sigma_small.iter().sum();
         let sum_large: f64 = sigma_large.iter().sum();
@@ -800,9 +779,8 @@ mod tests {
             log_evidence,
             chi_squared: 1.0,
             solution: Solution {
-                r: vec![],
-                p_r: vec![],
-                p_r_err: None,
+                coeffs: vec![],
+                coeff_err: None,
                 i_calc: vec![],
                 chi_squared: 1.0,
                 lambda_effective: Some(1.0),
@@ -828,7 +806,7 @@ mod tests {
     #[test]
     fn log_evidence_matches_formula() {
         let m = make_test_matrices();
-        let n_r = m.r.len();
+        let n_r = m.ktk.ncols();
 
         let lambda = 0.01_f64;
         let evals = evaluate_lambda_grid(&[lambda], &m).unwrap();
@@ -836,23 +814,16 @@ mod tests {
 
         // Recompute log det independently from the same matrix
         let mat = &m.ktk + &m.ltl * ev.lambda_eff;
-        let chol = mat.cholesky().expect("Cholesky should succeed for this test matrix");
-        let log_det = 2.0
-            * chol
-                .l()
-                .diagonal()
-                .iter()
-                .map(|&x| x.ln())
-                .sum::<f64>();
+        let chol = mat
+            .cholesky()
+            .expect("Cholesky should succeed for this test matrix");
+        let log_det = 2.0 * chol.l().diagonal().iter().map(|&x| x.ln()).sum::<f64>();
 
         let expected = -0.5
             * (ev.rss_weighted + ev.lambda_eff * ev.solution_norm + log_det
                 - n_r as f64 * ev.lambda_eff.ln());
 
-        assert!(
-            ev.log_evidence.is_finite(),
-            "log_evidence should be finite"
-        );
+        assert!(ev.log_evidence.is_finite(), "log_evidence should be finite");
         assert!(
             (ev.log_evidence - expected).abs() < 1e-10,
             "log_evidence {:.6e} does not match formula {:.6e}",
@@ -874,9 +845,8 @@ mod tests {
             log_evidence: 0.0,
             chi_squared: 1.0,
             solution: Solution {
-                r: vec![],
-                p_r: vec![],
-                p_r_err: None,
+                coeffs: vec![],
+                coeff_err: None,
                 i_calc: vec![],
                 chi_squared: 1.0,
                 lambda_effective: Some(1.0),
@@ -893,6 +863,9 @@ mod tests {
             make_eval(1e0, 1e-3),
         ];
         let idx = LCurveSelector.select(&evals);
-        assert!(idx > 0 && idx < 4, "L-curve corner should be interior, got {idx}");
+        assert!(
+            idx > 0 && idx < 4,
+            "L-curve corner should be interior, got {idx}"
+        );
     }
 }

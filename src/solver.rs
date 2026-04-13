@@ -24,16 +24,14 @@ pub enum SolverError {
 /// The result of an IFT solve.
 #[derive(Debug, Clone)]
 pub struct Solution {
-    /// r values at which P(r) is evaluated (one per basis function).
-    pub r: Vec<f64>,
+    /// Solved free basis coefficients.
+    ///
+    /// For the spline basis these are control weights, not sampled P(r)
+    /// values. Use the basis layer to evaluate them on an output grid.
+    pub coeffs: Vec<f64>,
 
-    /// P(r) coefficients. May contain negative values in M1 (unregularised).
-    /// From M2 onwards, a non-negativity constraint is applied.
-    pub p_r: Vec<f64>,
-
-    /// Uncertainty on P(r) (one σ per r value).
-    /// `None` until M4 adds Bayesian posterior covariance estimates.
-    pub p_r_err: Option<Vec<f64>>,
+    /// Marginal uncertainty on the solved coefficients.
+    pub coeff_err: Option<Vec<f64>>,
 
     /// Back-calculated I(q) from the solution: I_calc = K · c.
     pub i_calc: Vec<f64>,
@@ -78,7 +76,6 @@ pub trait Solver: Send + Sync {
     /// - `k_unweighted` — unweighted kernel (for back-calculation and χ²)
     /// - `i_observed`   — original (unweighted) intensities
     /// - `sigma`        — measurement errors (for χ² calculation)
-    /// - `r`            — r-grid values from the BasisSet
     fn solve(
         &self,
         k_weighted: &DMatrix<f64>,
@@ -86,7 +83,6 @@ pub trait Solver: Send + Sync {
         k_unweighted: &DMatrix<f64>,
         i_observed: &[f64],
         sigma: &[f64],
-        r: &[f64],
     ) -> Result<Solution>;
 }
 
@@ -128,7 +124,6 @@ impl Solver for LeastSquaresSvd {
         k_unweighted: &DMatrix<f64>,
         i_observed: &[f64],
         sigma: &[f64],
-        r: &[f64],
     ) -> Result<Solution> {
         let (n_q, n_r) = (k_weighted.nrows(), k_weighted.ncols());
 
@@ -146,14 +141,12 @@ impl Solver for LeastSquaresSvd {
             .solve(&b, self.svd_eps)
             .map_err(|e| anyhow!("SVD solve failed: {}", e))?;
 
-        let p_r: Vec<f64> = coeffs.iter().cloned().collect();
         let i_calc: Vec<f64> = (k_unweighted * &coeffs).iter().cloned().collect();
         let chi_squared = reduced_chi_squared(i_observed, &i_calc, sigma);
 
         Ok(Solution {
-            r: r.to_vec(),
-            p_r,
-            p_r_err: None,
+            coeffs: coeffs.iter().cloned().collect(),
+            coeff_err: None,
             i_calc,
             chi_squared,
             lambda_effective: None,
@@ -227,7 +220,6 @@ impl Solver for TikhonovSolver {
         k_unweighted: &DMatrix<f64>,
         i_observed: &[f64],
         sigma: &[f64],
-        r: &[f64],
     ) -> Result<Solution> {
         let (n_q, n_r) = (k_weighted.nrows(), k_weighted.ncols());
 
@@ -260,7 +252,7 @@ impl Solver for TikhonovSolver {
         let c_unc = solve_unconstrained(&a_full, &kti)?;
 
         // Apply non-negativity constraint (or not).
-        let p_r: Vec<f64> = if !self.nonneg.is_constraining() {
+        let coeffs: Vec<f64> = if !self.nonneg.is_constraining() {
             c_unc.iter().cloned().collect()
         } else {
             // Projected gradient NNLS: converges to the true constrained minimum
@@ -269,14 +261,13 @@ impl Solver for TikhonovSolver {
             projected_gradient_nnls(&a_full, &kti, &c_unc, self.max_nonneg_iter, 1e-8)
         };
 
-        let coeffs = DVector::from_column_slice(&p_r);
-        let i_calc: Vec<f64> = (k_unweighted * &coeffs).iter().cloned().collect();
+        let coeff_vec = DVector::from_column_slice(&coeffs);
+        let i_calc: Vec<f64> = (k_unweighted * &coeff_vec).iter().cloned().collect();
         let chi_squared = reduced_chi_squared(i_observed, &i_calc, sigma);
 
         Ok(Solution {
-            r: r.to_vec(),
-            p_r,
-            p_r_err: None,
+            coeffs,
+            coeff_err: None,
             i_calc,
             chi_squared,
             lambda_effective: Some(lambda_eff),
@@ -340,33 +331,31 @@ mod tests {
         let k = DMatrix::<f64>::identity(3, 3);
         let i_w = vec![0.1_f64, 2.0, -0.5];
         let sigma = vec![1.0_f64; 3];
-        let r = vec![10.0_f64, 20.0, 30.0];
-
         let solver = TikhonovSolver::new(0.0);
         let sol = solver
-            .solve(&k, &i_w, &k, &i_w, &sigma, &r)
+            .solve(&k, &i_w, &k, &i_w, &sigma)
             .expect("solve must succeed");
 
-        assert_eq!(sol.p_r.len(), 3);
+        assert_eq!(sol.coeffs.len(), 3);
         assert!(
-            sol.p_r.iter().all(|&x| x >= 0.0),
-            "all P(r) values must be non-negative; got {:?}",
-            sol.p_r
+            sol.coeffs.iter().all(|&x| x >= 0.0),
+            "all coefficients must be non-negative; got {:?}",
+            sol.coeffs
         );
         assert!(
-            (sol.p_r[0] - 0.1).abs() < 1e-5,
-            "p_r[0] should be ~0.1, got {}",
-            sol.p_r[0]
+            (sol.coeffs[0] - 0.1).abs() < 1e-5,
+            "coeffs[0] should be ~0.1, got {}",
+            sol.coeffs[0]
         );
         assert!(
-            (sol.p_r[1] - 2.0).abs() < 1e-5,
-            "p_r[1] should be ~2.0, got {}",
-            sol.p_r[1]
+            (sol.coeffs[1] - 2.0).abs() < 1e-5,
+            "coeffs[1] should be ~2.0, got {}",
+            sol.coeffs[1]
         );
         assert!(
-            sol.p_r[2].abs() < 1e-5,
-            "p_r[2] should be ~0.0, got {}",
-            sol.p_r[2]
+            sol.coeffs[2].abs() < 1e-5,
+            "coeffs[2] should be ~0.0, got {}",
+            sol.coeffs[2]
         );
     }
 }
