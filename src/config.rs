@@ -20,9 +20,7 @@ pub struct PreprocessingConfig {
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct BasisConfig {
-    #[serde(rename = "type")]
-    pub basis_type: Option<String>,
-    pub npoints: Option<usize>,
+    pub n_basis: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -97,14 +95,12 @@ qmax = 0.50
 negative_handling = "omit"
 
 [basis]
-type = "spline"
-npoints = 30
+n_basis = 30
 "#;
         let cfg: UnfourierConfig = toml::from_str(text).unwrap();
         assert_eq!(cfg.regularisation.method.as_deref(), Some("lcurve"));
         assert_eq!(cfg.preprocessing.qmin, Some(0.01));
-        assert_eq!(cfg.basis.basis_type.as_deref(), Some("spline"));
-        assert_eq!(cfg.basis.npoints, Some(30));
+        assert_eq!(cfg.basis.n_basis, Some(30));
     }
 
     #[test]
@@ -112,6 +108,19 @@ npoints = 30
         let cfg: UnfourierConfig = toml::from_str("").unwrap();
         assert!(cfg.regularisation.lambda_min.is_none());
         assert!(cfg.preprocessing.qmax.is_none());
+    }
+
+    #[test]
+    fn old_basis_kind_is_rejected() {
+        let text = r#"
+[basis]
+type = "rect"
+"#;
+        let err = toml::from_str::<UnfourierConfig>(text).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

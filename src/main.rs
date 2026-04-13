@@ -1,16 +1,16 @@
 mod config;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 
 use unfourier::{
-    basis::{BasisSet, CubicBSpline, UniformGrid},
-    data::{parse_dat, SaxsData},
+    basis::{BasisSet, CubicBSpline},
+    data::{SaxsData, parse_dat},
     kernel::build_weighted_system,
     lambda_select::{
-        estimate_lambda_range, evaluate_lambda_grid, log_lambda_grid, posterior_sigma,
         BayesianEvidence, GcvSelector, GridMatrices, LCurveSelector, LambdaSelector,
+        estimate_lambda_range, evaluate_lambda_grid, log_lambda_grid, posterior_sigma,
     },
     output::{print_summary, write_fit_to_file, write_pr_to_file, write_pr_to_stdout},
     preprocess::{ClipNegative, LogRebin, OmitNonPositive, Preprocessor, QRangeSelector},
@@ -33,16 +33,6 @@ enum NegativeHandling {
     Omit,
     /// Leave non-positive intensities unchanged.
     Keep,
-}
-
-/// Which basis to use for representing P(r).
-#[derive(Debug, Clone, ValueEnum, Default)]
-enum BasisChoice {
-    /// Piecewise-constant rectangular bins (default, matches M1–M4 behaviour).
-    #[default]
-    Rect,
-    /// Cubic B-spline basis with zero boundary conditions (M5).
-    Spline,
 }
 
 /// How to choose the regularisation strength λ.
@@ -90,22 +80,10 @@ struct Args {
     #[arg(long)]
     rmax: Option<f64>,
 
-    /// Basis set for representing P(r).
-    /// 'rect'   — piecewise-constant rectangular bins (default).
-    /// 'spline' — cubic B-splines with zero boundary conditions (M5).
-    #[arg(long, value_enum, default_value_t = BasisChoice::Rect)]
-    basis: BasisChoice,
-
-    /// Number of free basis parameters.
-    /// For 'rect'   defaults to --npoints (100).
-    /// For 'spline' defaults to 20.
-    /// Overrides --npoints when provided.
+    /// Number of free cubic B-spline basis parameters.
+    /// Defaults to 20.
     #[arg(long)]
     n_basis: Option<usize>,
-
-    /// Number of r grid points (rectangular basis only; superseded by --n-basis).
-    #[arg(long, default_value_t = 100)]
-    npoints: usize,
 
     /// Number of λ candidates in the automatic search grid.
     /// More points = finer search but slower. 60 is usually sufficient.
@@ -291,11 +269,11 @@ fn main() -> Result<()> {
         if args.method.is_none() {
             if let Some(ref m) = cfg.regularisation.method {
                 let parsed = match m.as_str() {
-                    "gcv"    => Some(Method::Gcv),
+                    "gcv" => Some(Method::Gcv),
                     "lcurve" => Some(Method::Lcurve),
-                    "bayes"  => Some(Method::Bayes),
+                    "bayes" => Some(Method::Bayes),
                     "manual" => Some(Method::Manual),
-                    other    => return Err(anyhow!("unfourier.toml: unknown method '{}'", other)),
+                    other => return Err(anyhow!("unfourier.toml: unknown method '{}'", other)),
                 };
                 args.method = parsed;
                 if args.verbose {
@@ -341,9 +319,8 @@ fn main() -> Result<()> {
         // "user set" vs "default" purely from Option; skip override to keep
         // CLI default behaviour unchanged.
         // [basis]
-        // npoints also has a clap default; only apply from TOML if n_basis unset.
         if args.n_basis.is_none() {
-            if let Some(n) = cfg.basis.npoints {
+            if let Some(n) = cfg.basis.n_basis {
                 args.n_basis = Some(n);
                 if args.verbose {
                     eprintln!("  [config]   n_basis = {}", n);
@@ -372,9 +349,7 @@ fn main() -> Result<()> {
     };
 
     if matches!(method, Method::Manual) && args.lambda.is_none() {
-        return Err(anyhow!(
-            "--method manual requires --lambda to be specified"
-        ));
+        return Err(anyhow!("--method manual requires --lambda to be specified"));
     }
 
     // ---- 1. Parse -------------------------------------------------------
@@ -421,14 +396,16 @@ fn main() -> Result<()> {
     }
 
     // Step B: q-range / SNR filtering.
-    let use_qrange = args.qmin.is_some()
-        || args.qmax.is_some()
-        || args.snr_cutoff > 0.0;
+    let use_qrange = args.qmin.is_some() || args.qmax.is_some() || args.snr_cutoff > 0.0;
     if use_qrange {
         let step = QRangeSelector {
             q_min: args.qmin,
             q_max: args.qmax,
-            snr_threshold: if args.snr_cutoff > 0.0 { Some(args.snr_cutoff) } else { None },
+            snr_threshold: if args.snr_cutoff > 0.0 {
+                Some(args.snr_cutoff)
+            } else {
+                None
+            },
         };
         let before = data.len();
         data = step.process(data)?;
@@ -473,28 +450,11 @@ fn main() -> Result<()> {
         eprintln!("  r_max = {:.2} Å  (user-specified)", r_max);
     }
 
-    let basis: Box<dyn BasisSet> = match args.basis {
-        BasisChoice::Rect => {
-            let n = args.n_basis.unwrap_or(args.npoints);
-            let b = UniformGrid::new(r_max, n);
-            if args.verbose {
-                eprintln!(
-                    "  basis: rect  n={} bins  Δr={:.4} Å",
-                    n,
-                    b.delta_r()
-                );
-            }
-            Box::new(b)
-        }
-        BasisChoice::Spline => {
-            let n = args.n_basis.unwrap_or(20);
-            let b = CubicBSpline::new(r_max, n);
-            if args.verbose {
-                eprintln!("  basis: spline  n_basis={}", n);
-            }
-            Box::new(b)
-        }
-    };
+    let n_basis_user = args.n_basis.unwrap_or(20);
+    let basis = CubicBSpline::new(r_max, n_basis_user);
+    if args.verbose {
+        eprintln!("  basis: cubic-b-spline  n_basis={}", n_basis_user);
+    }
 
     // ---- 4 + 5. Build system and solve -----------------------------------
 
@@ -511,21 +471,19 @@ fn main() -> Result<()> {
                 d1_weight
             );
         }
-        Box::new(BoundaryAnchoredCombined { d1_weight, d2_weight: 1.0 })
+        Box::new(BoundaryAnchoredCombined {
+            d1_weight,
+            d2_weight: 1.0,
+        })
     } else {
-        Box::new(BoundaryAnchoredCombined { d1_weight: 0.0, d2_weight: 1.0 })
+        Box::new(BoundaryAnchoredCombined {
+            d1_weight: 0.0,
+            d2_weight: 1.0,
+        })
     };
     let ltl = reg.gram_matrix(n_basis);
 
-    let mut solution = run_solve(
-        &data,
-        basis.as_ref(),
-        &method,
-        &args,
-        args.verbose,
-        ltl,
-        reg,
-    )?;
+    let mut solution = run_solve(&data, &basis, &method, &args, args.verbose, ltl, reg)?;
 
     // ---- Hard boundary conditions: P(r=0) = P(r=D_max) = 0 ----------------
     // Post-hoc insert explicit boundary rows and project boundary-adjacent
@@ -543,8 +501,8 @@ fn main() -> Result<()> {
 
     // Slope condition: zero out the first and last INTERIOR bins.
     // For splines: P'(0) ∝ c[1] (clamped B-spline derivative formula) → exact zero.
-    // For rect: P(Δr/2) = 0 (first/last interior bin forced to zero).
-    // Both are at indices 1 and last-1 after the boundary insertion above.
+    // Both boundary-adjacent coefficients are at indices 1 and last-1 after the
+    // boundary insertion above.
     let last = solution.p_r.len() - 1;
     solution.p_r[1] = 0.0;
     solution.p_r[last - 1] = 0.0;

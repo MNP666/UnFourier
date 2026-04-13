@@ -4,7 +4,7 @@ This document describes every stage of the IFT pipeline — what it computes, wh
 and the mathematics behind it.  The implementation follows the same order:
 
 ```
-parse → preprocess → basis → build system → [constrain] → λ selection → solve → non-negativity → output
+parse → preprocess → basis → build system → regularise → λ selection → solve → non-negativity → output
 ```
 
 ---
@@ -81,31 +81,11 @@ P(r) is represented as a finite linear combination of basis functions φ_j(r):
 P(r) ≈ Σ_j  c_j · φ_j(r)
 ```
 
-The choice of basis determines smoothness properties and boundary behaviour.
+The project now uses cubic B-splines as the active basis. The old rectangular
+histogram basis was useful for the first vertical slice, but it cannot produce
+smooth endpoint behaviour and is no longer part of the active CLI.
 
-### 3a  Rectangular bins (`--basis rect`)
-
-The simplest basis: n equal-width bins of width Δr = D_max / n,
-
-```
-φ_j(r) = 1   if  (j-½)Δr ≤ r < (j+½)Δr
-        = 0   otherwise
-```
-
-The kernel integral
-
-```
-K_ij = ∫ φ_j(r) · sinc(q_i r) · r² dr
-     = ∫_{r_j - Δr/2}^{r_j + Δr/2}  4π r² sinc(q_i r) dr
-```
-
-is evaluated analytically (closed-form antiderivative of r² sinc(qr)).
-
-The bin centres r_j = (j + ½)Δr are the output r-grid.  By construction,
-the last bin centre sits at D_max − Δr/2; P(r) is not structurally zero at
-D_max. Boundary constraints (Stage 5) correct this.
-
-### 3b  Cubic B-splines (`--basis spline`)
+### 3a  Cubic B-splines
 
 P(r) is represented on a clamped knot vector.  For n free parameters, the code
 builds n + 2 B-splines on the knot vector
@@ -171,36 +151,15 @@ weighting entirely separate from regularisation.
 
 ---
 
-## 5  Boundary constraints (optional, rect basis only)
+## 5  Boundary handling
 
-**Module:** `src/kernel.rs`  
-**Function:** `append_boundary_constraints`
+For the current spline basis, endpoint values are represented structurally. The
+clamped knot vector contains endpoint B-splines that are non-zero at r = 0 and
+r = D_max; the active `CubicBSpline` implementation drops those endpoint columns
+from the kernel, so no free coefficient can make P(0) or P(D_max) non-zero.
 
-For the rect basis, P(r) is not structurally zero at r = 0 or r = D_max.
-Two soft equality constraints are added by augmenting the weighted system with
-virtual data rows:
-
-```
-[ K_w    ]       [ I_w ]
-[ w·e₁ᵀ ]  c  ≈ [  0  ]   ← P(r = 0)    = 0
-[ w·eₙᵀ ]       [  0  ]   ← P(r = D_max) = 0
-```
-
-where e₁ and eₙ are the first and last standard basis vectors. These rows look
-exactly like two additional data points with target value zero, so they flow
-through GCV, L-curve, and Bayesian evidence without special-casing.
-
-**Choosing the weight.** The default weight is:
-
-```
-w = sqrt(N) × rms(1/σ)     where  rms(1/σ) = sqrt(mean_i(1/σ_i²))
-```
-
-This makes the constraint as influential as roughly √N data points — decisive
-without dominating the fit. The TOML `boundary_weight` field scales this:
-`0.0` = automatic, `k > 0` = k × default, `-1` = disabled.
-
-Enabled via `[constraints] boundary_weight = 0` in `unfourier.toml`.
+M8 is tightening this further by removing post-hoc output mutation and replacing
+raw coefficient output with evaluated spline samples.
 
 ---
 
@@ -241,7 +200,7 @@ D₁[i, i+1] = +1
 ```
 
 Minimising ‖D₁ c‖² penalises slope — it penalises large step changes between
-adjacent bins, targeting single-step discontinuities that the curvature penalty
+adjacent coefficients, targeting single-step discontinuities that the curvature penalty
 misses.
 
 ### 6c  Combined penalty (M8)
@@ -484,20 +443,13 @@ the boundary points.  The output stage appends explicit rows `(0, 0)` and
                             │
               ┌─────────────▼───────────────┐
               │  BASIS                       │
-              │  rect: uniform bins          │
-              │  spline: clamped B-splines   │
+              │  clamped cubic B-splines     │
               └─────────────┬───────────────┘
                             │
               ┌─────────────▼───────────────┐
               │  BUILD WEIGHTED SYSTEM       │
               │  K_w = diag(1/σ) · K         │
               │  I_w = I / σ                 │
-              └─────────────┬───────────────┘
-                            │
-              ┌─────────────▼───────────────┐
-              │  BOUNDARY CONSTRAINTS        │  ← rect only, optional
-              │  Augment K_w, I_w with       │
-              │  soft P(0)=P(Dmax)=0 rows    │
               └─────────────┬───────────────┘
                             │
               ┌─────────────▼───────────────┐

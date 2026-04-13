@@ -8,7 +8,7 @@ A Rust implementation of Indirect Fourier Transformation (IFT) for Small Angle X
 
 **SAXS IFT in Rust.** unFourier recovers the pair distance distribution function P(r) from a measured scattering curve I(q). This is an ill-posed inverse problem: the kernel is a Fredholm integral equation of the first kind, and regularisation is essential to prevent the solution from fitting noise. The project implements and compares several approaches — Tikhonov regularisation with manual λ, automatic selection via GCV and L-curve, and Bayesian evidence maximisation — all operating on the same clean pipeline.
 
-**Flexible and extensible by design.** The pipeline is built around a small set of traits (`BasisSet`, `Solver`, `Regulariser`, `LambdaSelector`, `Preprocessor`) so that components can be swapped or extended without restructuring the rest of the code. Want to replace rectangular bins with B-splines? Swap the `BasisSet`. Want to try a new λ selection strategy? Implement `LambdaSelector`. The interfaces are more important than the initial implementations.
+**Flexible and extensible by design.** The pipeline is built around a small set of traits (`BasisSet`, `Solver`, `Regulariser`, `LambdaSelector`, `Preprocessor`) so that components can be swapped or extended without restructuring the rest of the code. Want to try a new λ selection strategy? Implement `LambdaSelector`. The interfaces are more important than the initial implementations.
 
 **Parallelism-ready.** Each λ evaluation is stateless and self-contained, making the grid search a natural target for `rayon::par_iter()`. The design avoids shared mutable state in hot paths so that parallelism can be added in one place when needed, without refactoring the solver.
 
@@ -61,9 +61,7 @@ Options:
   --method <METHOD>          gcv | lcurve | bayes | manual  [default: gcv]
   --lambda <LAMBDA>          Regularisation strength (manual mode)
   --rmax <RMAX>              Maximum r in Å  [default: π / q_min]
-  --basis <BASIS>            rect | spline  [default: rect]
-  --n-basis <N>              Number of free basis parameters
-  --npoints <N>              r grid points for rect basis  [default: 100]
+  --n-basis <N>              Number of free cubic B-spline basis parameters
   --lambda-count <N>         Grid size for automatic search  [default: 60]
   --lambda-min <F>           Lower bound of λ search grid
   --lambda-max <F>           Upper bound of λ search grid
@@ -91,8 +89,8 @@ unfourier data.dat --rmax 150 --method lcurve --output pr.dat
 # Bayesian IFT — produces 3-column output with error bars: r, P(r), σ_P(r)
 unfourier data.dat --rmax 150 --method bayes --output pr.dat --verbose
 
-# B-spline basis (structurally zero at both boundaries)
-unfourier data.dat --rmax 150 --basis spline --n-basis 20 --output pr.dat
+# Choose the number of free B-spline basis parameters
+unfourier data.dat --rmax 150 --n-basis 20 --output pr.dat
 
 # Manual λ
 unfourier data.dat --rmax 150 --lambda 0.01 --output pr.dat
@@ -119,13 +117,9 @@ qmin = 0.01             # Å⁻¹ — discard points below this q
 qmax = 0.35             # Å⁻¹ — discard points above this q
 
 [basis]
-npoints = 100           # number of r grid points / basis parameters
+n_basis = 20            # number of free cubic B-spline basis parameters
 
 [constraints]
-# Boundary enforcement: P(r=0) = P(r=D_max) = 0 (rect basis only)
-# -1 = disabled (default), 0 = automatic weight, >0 = explicit multiplier
-boundary_weight = 0.0
-
 # First-derivative slope penalty (combined with curvature regularisation)
 # -1 = disabled (default), 0 = weight 1.0, >0 = explicit weight
 d1_smoothness = -1.0
@@ -156,9 +150,9 @@ UnFourier/
 │   ├── main.rs           # CLI entry point and pipeline wiring
 │   ├── lib.rs            # Module exports
 │   ├── data.rs           # .dat parser, SaxsData struct
-│   ├── basis.rs          # BasisSet trait, UniformGrid (rect), CubicBSpline (M5)
+│   ├── basis.rs          # BasisSet trait and CubicBSpline basis
 │   ├── bspline.rs        # Cox–de Boor B-spline evaluation and quadrature (M5)
-│   ├── kernel.rs         # Weighted system matrix, boundary constraint augmentation
+│   ├── kernel.rs         # Weighted system matrix and back-calculation
 │   ├── solver.rs         # Solver trait, LeastSquaresSvd, TikhonovSolver
 │   ├── regularise.rs     # Regulariser trait + SecondDerivative, FirstDerivative,
 │   │                     #   CombinedDerivative (M8)
@@ -197,8 +191,8 @@ Each stage is abstracted behind a trait, making the system extensible without mo
 | Module | Trait | Implementations |
 |--------|-------|-----------------|
 | `data.rs` | — | `SaxsData`: holds q, I(q), σ(q); parses 3-column `.dat` files |
-| `basis.rs` | `BasisSet` | `UniformGrid` (rect bins), `CubicBSpline` (clamped B-splines) |
-| `kernel.rs` | — | `build_weighted_system`, `append_boundary_constraints` |
+| `basis.rs` | `BasisSet` | `CubicBSpline` (clamped B-splines) |
+| `kernel.rs` | — | `build_weighted_system`, `back_calculate` |
 | `regularise.rs` | `Regulariser` | `SecondDerivative`, `FirstDerivative`, `CombinedDerivative` |
 | `solver.rs` | `Solver` | `LeastSquaresSvd` (M1), `TikhonovSolver` (M2+) |
 | `lambda_select.rs` | `LambdaSelector` | `GcvSelector`, `LCurveSelector`, `BayesianEvidence` |

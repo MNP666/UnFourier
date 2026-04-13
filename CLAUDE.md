@@ -22,8 +22,8 @@ unfourier data.dat --method lcurve --rmax 100 -o pr.dat
 # Run Bayesian IFT (produces 3-column output: r, P(r), σ_P(r))
 unfourier data.dat --method bayes --rmax 150 --output pr.dat --verbose
 
-# Use cubic B-spline basis (M5) instead of rectangular bins
-unfourier data.dat --basis spline --n-basis 20 --rmax 150 -o pr.dat
+# Choose the number of free cubic B-spline basis parameters
+unfourier data.dat --n-basis 20 --rmax 150 -o pr.dat
 
 # Preprocessing options: q-range, SNR cutoff, log-rebinning
 unfourier data.dat --qmin 0.01 --qmax 0.35 --snr-cutoff 1.0 --rebin 200 -o pr.dat
@@ -54,7 +54,7 @@ Each stage is abstracted behind a trait, making the system extensible without mo
 | Module | Trait | Current Implementation |
 |--------|-------|------------------------|
 | `data.rs` | — | `SaxsData`: holds q, I(q), σ(q); parses 3-column `.dat` files |
-| `basis.rs` | `BasisSet` | `UniformGrid` (rect bins); `CubicBSpline` (M5, interior B-splines with implicit zero endpoints) |
+| `basis.rs` | `BasisSet` | `CubicBSpline` (M5, interior B-splines with implicit zero endpoints) |
 | `bspline.rs` | — | Clamped knot vectors, B-spline evaluation, sinc kernel integration |
 | `kernel.rs` | — | Builds weighted system matrix K from basis + data |
 | `regularise.rs` | `Regulariser` | `BoundaryAnchoredCombined`: D̃₁ + D̃₂ with zero-boundary anchoring; also `SecondDerivative`, `FirstDerivative`, `CombinedDerivative` |
@@ -86,7 +86,7 @@ Each stage is abstracted behind a trait, making the system extensible without mo
 
 ## Open Issue: M8 — Smooth boundary conditions
 
-**Problem:** P(r) at r=0 and r=D_max should go smoothly to zero. The current approach cannot achieve this simultaneously for both:
+**Problem:** P(r) at r=0 and r=D_max should go smoothly to zero. The current approach cannot achieve this:
 
 - **Without hard zeroing:** The interior bins adjacent to the boundary take non-zero values — P(r) is non-zero at the edges.
 - **With hard zeroing** (post-hoc zero-clamp of first/last interior bin): P(r) hits zero at the boundary point but is discontinuous — the interior bins just inside are finite, so the curve steps to zero rather than sloping to zero.
@@ -96,13 +96,12 @@ Each stage is abstracted behind a trait, making the system extensible without mo
 2. Post-hoc insertion of explicit (r=0, P=0) and (r=D_max, P=0) rows in the output.
 3. Hard zero-clamp of the first and last interior coefficient after solve (`p_r[1] = 0.0`, `p_r[last-1] = 0.0` in `main.rs:549–550`).
 
-**Root cause:** The piecewise-constant (rect) basis can only go to zero at the boundary if the nearest bin has exactly zero value — there's no smooth interpolation. The cubic B-spline basis has the same problem unless the endpoint B-splines are excluded and clamped correctly. Zeroing interior bins post-hoc creates a visible discontinuity at one bin inward from the boundary.
+**Root cause:** The cubic B-spline basis can enforce exact zero endpoint values, but the current output path still mutates solved values post-hoc. Zeroing interior coefficients after solving creates a visible discontinuity one sample inward from the boundary and makes the written P(r) inconsistent with the coefficients used for I(q).
 
 **Candidate approaches still to explore:**
-- For the rect basis: enforce zero through the regulariser alone (no hard clamp) and accept a soft boundary that regularisation pushes down but cannot enforce exactly.
-- For splines: verify that dropping the endpoint B-splines (as currently done in `CubicBSpline`) truly forces P(0)=P(D_max)=0 exactly — and whether the derivative condition is also met.
+- For splines: verify that dropping the endpoint B-splines (as currently done in `CubicBSpline`) truly forces P(0)=P(D_max)=0 exactly — and whether optional derivative constraints should be exposed.
 - Add explicit boundary constraint rows to the design matrix (augmented least-squares) rather than a post-hoc clamp.
-- Switch from bin-centre representation to a basis that naturally interpolates to zero at both endpoints.
+- Evaluate the spline expansion for output instead of writing raw coefficients or post-hoc edited values.
 
 ## Validation Notes
 

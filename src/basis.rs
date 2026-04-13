@@ -1,5 +1,5 @@
-use nalgebra::DMatrix;
 use crate::bspline;
+use nalgebra::DMatrix;
 
 /// A set of basis functions for representing P(r).
 ///
@@ -16,8 +16,7 @@ use crate::bspline;
 ///
 /// # Implementations
 ///
-/// - [`UniformGrid`] (M1): rectangular/histogram basis, P(r) piecewise constant
-/// - `CubicBSpline` (M5): compact-support splines for a smoother representation
+/// - `CubicBSpline`: compact-support splines for a smooth representation
 pub trait BasisSet: Send + Sync {
     /// The r-values at which the basis is centred (one per coefficient).
     fn r_values(&self) -> &[f64];
@@ -34,50 +33,6 @@ pub trait BasisSet: Send + Sync {
     ///
     /// K_ij = contribution of basis function j to I(q_i).
     fn build_kernel_matrix(&self, q: &[f64]) -> DMatrix<f64>;
-}
-
-// ---------------------------------------------------------------------------
-// UniformGrid — rectangular/histogram basis
-// ---------------------------------------------------------------------------
-
-/// Uniform rectangular basis: P(r) is approximated as piecewise constant on a
-/// uniform grid of `n_points` interior bins over (0, r_max).
-///
-/// The r-grid has `n_points` entries (bin centres only):
-///   r[j] = (j + 0.5) · Δr  for j = 0 … n_points−1
-///
-/// Boundary values P(0) = P(r_max) = 0 are imposed via the
-/// boundary-anchored regulariser (which penalises c[0] and c[n-1] as
-/// slopes from the implicit zero boundaries) and post-hoc insertion of
-/// explicit (r=0, P=0) and (r=r_max, P=0) rows in the output.
-///
-/// This is a deliberately simple starting point. Replace with `CubicBSpline`
-/// in M5 for a smoother, more accurate representation with fewer coefficients.
-pub struct UniformGrid {
-    r: Vec<f64>,
-    r_max: f64,
-    delta_r: f64,
-}
-
-impl UniformGrid {
-    /// Create a uniform grid with `n_points` interior bin centres.
-    ///
-    /// Bin centres: r_j = (j + 0.5) · Δr  for j = 0 … n_points−1.
-    pub fn new(r_max: f64, n_points: usize) -> Self {
-        assert!(r_max > 0.0, "r_max must be positive");
-        assert!(n_points > 0, "n_points must be at least 1");
-
-        let delta_r = r_max / n_points as f64;
-        let r = (0..n_points)
-            .map(|j| (j as f64 + 0.5) * delta_r)
-            .collect();
-
-        Self { r, r_max, delta_r }
-    }
-
-    pub fn delta_r(&self) -> f64 {
-        self.delta_r
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -135,7 +90,11 @@ impl CubicBSpline {
         let all_greville = bspline::greville(&knots, 3);
         let r_interior = all_greville[1..all_greville.len() - 1].to_vec();
 
-        Self { knots, r_interior, r_max }
+        Self {
+            knots,
+            r_interior,
+            r_max,
+        }
     }
 }
 
@@ -157,36 +116,8 @@ impl BasisSet for CubicBSpline {
     fn build_kernel_matrix(&self, q: &[f64]) -> DMatrix<f64> {
         let full = bspline::sinc_kernel_matrix(&self.knots, 3, q);
         let n_cols = full.ncols(); // n_basis + 2
-        let n_free = n_cols - 2;  // n_basis
+        let n_free = n_cols - 2; // n_basis
         DMatrix::from_fn(full.nrows(), n_free, |i, j| full[(i, j + 1)])
-    }
-}
-
-impl BasisSet for UniformGrid {
-    fn r_values(&self) -> &[f64] {
-        &self.r
-    }
-
-    fn r_max(&self) -> f64 {
-        self.r_max
-    }
-
-    /// K_ij = 4π · sinc(q_i · r_j) · Δr   where sinc(x) = sin(x)/x.
-    fn build_kernel_matrix(&self, q: &[f64]) -> DMatrix<f64> {
-        let n_q = q.len();
-        let n_r = self.r.len();
-        let delta_r = self.delta_r;
-
-        DMatrix::from_fn(n_q, n_r, |i, j| {
-            let qr = q[i] * self.r[j];
-            // sinc limit: sin(qr)/(qr) → 1 as qr → 0
-            let sinc = if qr.abs() < 1e-10 {
-                1.0
-            } else {
-                qr.sin() / qr
-            };
-            4.0 * std::f64::consts::PI * sinc * delta_r
-        })
     }
 }
 
@@ -224,8 +155,10 @@ mod tests {
         assert_eq!(r.len(), 15);
         // All strictly inside (0, r_max) — endpoints are no longer included
         for &xi in r {
-            assert!(xi > 0.0 && xi < r_max,
-                "Greville abscissa {xi} not strictly inside (0, {r_max})");
+            assert!(
+                xi > 0.0 && xi < r_max,
+                "Greville abscissa {xi} not strictly inside (0, {r_max})"
+            );
         }
     }
 
@@ -236,7 +169,11 @@ mod tests {
         let bs = CubicBSpline::new(80.0, 12);
         let k = bs.build_kernel_matrix(&[0.0]);
         for j in 0..k.ncols() {
-            assert!(k[(0, j)] > 0.0, "K[0,{j}] = {} at q=0 (expected > 0)", k[(0, j)]);
+            assert!(
+                k[(0, j)] > 0.0,
+                "K[0,{j}] = {} at q=0 (expected > 0)",
+                k[(0, j)]
+            );
         }
     }
 }

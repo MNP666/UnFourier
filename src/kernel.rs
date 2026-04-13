@@ -14,10 +14,7 @@ use nalgebra::DMatrix;
 /// Keeping the weighting here (rather than inside the solver) means the
 /// solver only sees a standard unweighted least-squares problem, which
 /// makes it easier to swap solvers and regularisers independently.
-pub fn build_weighted_system(
-    basis: &dyn BasisSet,
-    data: &SaxsData,
-) -> (DMatrix<f64>, Vec<f64>) {
+pub fn build_weighted_system(basis: &dyn BasisSet, data: &SaxsData) -> (DMatrix<f64>, Vec<f64>) {
     let k = basis.build_kernel_matrix(&data.q);
     let n_q = data.q.len();
 
@@ -70,10 +67,10 @@ mod tests {
 
     #[test]
     fn build_weighted_system_shapes() {
-        use crate::basis::UniformGrid;
+        use crate::basis::CubicBSpline;
         use crate::data::SaxsData;
 
-        let basis = UniformGrid::new(10.0, 5); // 5 interior bins
+        let basis = CubicBSpline::new(10.0, 5);
         let q = vec![0.1_f64, 0.2, 0.3];
         let data = SaxsData {
             q,
