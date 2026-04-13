@@ -21,6 +21,9 @@ pub struct PreprocessingConfig {
 #[serde(deny_unknown_fields)]
 pub struct BasisConfig {
     pub n_basis: Option<usize>,
+    pub knot_spacing: Option<f64>,
+    pub min_basis: Option<usize>,
+    pub max_basis: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -96,11 +99,17 @@ negative_handling = "omit"
 
 [basis]
 n_basis = 30
+knot_spacing = 7.5
+min_basis = 12
+max_basis = 48
 "#;
         let cfg: UnfourierConfig = toml::from_str(text).unwrap();
         assert_eq!(cfg.regularisation.method.as_deref(), Some("lcurve"));
         assert_eq!(cfg.preprocessing.qmin, Some(0.01));
         assert_eq!(cfg.basis.n_basis, Some(30));
+        assert_eq!(cfg.basis.knot_spacing, Some(7.5));
+        assert_eq!(cfg.basis.min_basis, Some(12));
+        assert_eq!(cfg.basis.max_basis, Some(48));
     }
 
     #[test]
@@ -121,6 +130,34 @@ type = "rect"
             err.to_string().contains("unknown field"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn old_basis_npoints_is_rejected() {
+        let text = r#"
+[basis]
+npoints = 100
+"#;
+        let err = toml::from_str::<UnfourierConfig>(text).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_knot_spacing_basis_toml() {
+        let text = r#"
+[basis]
+knot_spacing = 7.5
+min_basis = 12
+max_basis = 48
+"#;
+        let cfg: UnfourierConfig = toml::from_str(text).unwrap();
+        assert_eq!(cfg.basis.n_basis, None);
+        assert_eq!(cfg.basis.knot_spacing, Some(7.5));
+        assert_eq!(cfg.basis.min_basis, Some(12));
+        assert_eq!(cfg.basis.max_basis, Some(48));
     }
 
     #[test]

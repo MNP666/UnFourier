@@ -48,6 +48,11 @@ enum Method {
     Manual,
 }
 
+const DEFAULT_N_BASIS: usize = 20;
+const DEFAULT_MIN_BASIS: usize = 12;
+const DEFAULT_MAX_BASIS: usize = 48;
+const MIN_N_BASIS: usize = 2;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "unfourier",
@@ -84,6 +89,19 @@ struct Args {
     /// Defaults to 20.
     #[arg(long)]
     n_basis: Option<usize>,
+
+    /// Target real-space spacing per free cubic B-spline parameter in Å.
+    /// Ignored when --n-basis is set.
+    #[arg(long)]
+    knot_spacing: Option<f64>,
+
+    /// Minimum n_basis when deriving it from --knot-spacing.
+    #[arg(long)]
+    min_basis: Option<usize>,
+
+    /// Maximum n_basis when deriving it from --knot-spacing.
+    #[arg(long)]
+    max_basis: Option<usize>,
 
     /// Number of λ candidates in the automatic search grid.
     /// More points = finer search but slower. 60 is usually sufficient.
@@ -136,6 +154,123 @@ struct Args {
     /// Print diagnostic summary (χ², selected λ, D_max estimate) to stderr.
     #[arg(short, long)]
     verbose: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Basis-size resolution
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+enum BasisCountSource {
+    Explicit,
+    KnotSpacing {
+        knot_spacing: f64,
+        min_basis: usize,
+        max_basis: usize,
+        unclamped: usize,
+    },
+    Default,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct BasisCount {
+    n_basis: usize,
+    source: BasisCountSource,
+}
+
+fn resolve_basis_count(args: &Args, r_max: f64) -> Result<BasisCount> {
+    validate_basis_options(args)?;
+
+    if !r_max.is_finite() || r_max <= 0.0 {
+        return Err(anyhow!("r_max must be positive and finite, got {}", r_max));
+    }
+
+    if let Some(n_basis) = args.n_basis {
+        return Ok(BasisCount {
+            n_basis,
+            source: BasisCountSource::Explicit,
+        });
+    }
+
+    if let Some(knot_spacing) = args.knot_spacing {
+        let min_basis = args.min_basis.unwrap_or(DEFAULT_MIN_BASIS);
+        let max_basis = args.max_basis.unwrap_or(DEFAULT_MAX_BASIS);
+        let raw = (r_max / knot_spacing).ceil();
+        if raw > usize::MAX as f64 {
+            return Err(anyhow!(
+                "derived n_basis from r_max/knot_spacing is too large: ceil({:.6e} / {:.6e})",
+                r_max,
+                knot_spacing
+            ));
+        }
+
+        let unclamped = raw as usize;
+        let n_basis = unclamped.clamp(min_basis, max_basis);
+        return Ok(BasisCount {
+            n_basis,
+            source: BasisCountSource::KnotSpacing {
+                knot_spacing,
+                min_basis,
+                max_basis,
+                unclamped,
+            },
+        });
+    }
+
+    Ok(BasisCount {
+        n_basis: DEFAULT_N_BASIS,
+        source: BasisCountSource::Default,
+    })
+}
+
+fn validate_basis_options(args: &Args) -> Result<()> {
+    if let Some(n_basis) = args.n_basis {
+        if n_basis < MIN_N_BASIS {
+            return Err(anyhow!(
+                "--n-basis must be at least {}, got {}",
+                MIN_N_BASIS,
+                n_basis
+            ));
+        }
+    }
+
+    if let Some(knot_spacing) = args.knot_spacing {
+        if !knot_spacing.is_finite() || knot_spacing <= 0.0 {
+            return Err(anyhow!(
+                "--knot-spacing must be positive and finite, got {}",
+                knot_spacing
+            ));
+        }
+    }
+
+    if args.knot_spacing.is_some() || args.min_basis.is_some() || args.max_basis.is_some() {
+        let min_basis = args.min_basis.unwrap_or(DEFAULT_MIN_BASIS);
+        let max_basis = args.max_basis.unwrap_or(DEFAULT_MAX_BASIS);
+
+        if min_basis < MIN_N_BASIS {
+            return Err(anyhow!(
+                "--min-basis must be at least {}, got {}",
+                MIN_N_BASIS,
+                min_basis
+            ));
+        }
+        if max_basis < MIN_N_BASIS {
+            return Err(anyhow!(
+                "--max-basis must be at least {}, got {}",
+                MIN_N_BASIS,
+                max_basis
+            ));
+        }
+        if min_basis > max_basis {
+            return Err(anyhow!(
+                "--min-basis ({}) must be <= --max-basis ({})",
+                min_basis,
+                max_basis
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +385,8 @@ fn run_solve(
 
 fn main() -> Result<()> {
     let mut args = Args::parse();
+    let cli_n_basis = args.n_basis.is_some();
+    let cli_knot_spacing = args.knot_spacing.is_some();
 
     // ---- 0. Load optional TOML config and fill unset CLI args ---------------
     // d1_weight: relative weight for the first-derivative penalty in the
@@ -317,11 +454,35 @@ fn main() -> Result<()> {
         // "user set" vs "default" purely from Option; skip override to keep
         // CLI default behaviour unchanged.
         // [basis]
-        if args.n_basis.is_none() {
+        if !cli_n_basis && !cli_knot_spacing && args.n_basis.is_none() {
             if let Some(n) = cfg.basis.n_basis {
                 args.n_basis = Some(n);
                 if args.verbose {
                     eprintln!("  [config]   n_basis = {}", n);
+                }
+            }
+        }
+        if !cli_n_basis && args.n_basis.is_none() && args.knot_spacing.is_none() {
+            if let Some(v) = cfg.basis.knot_spacing {
+                args.knot_spacing = Some(v);
+                if args.verbose {
+                    eprintln!("  [config]   knot_spacing = {:.4}", v);
+                }
+            }
+        }
+        if args.knot_spacing.is_some() && args.min_basis.is_none() {
+            if let Some(n) = cfg.basis.min_basis {
+                args.min_basis = Some(n);
+                if args.verbose {
+                    eprintln!("  [config]   min_basis = {}", n);
+                }
+            }
+        }
+        if args.knot_spacing.is_some() && args.max_basis.is_none() {
+            if let Some(n) = cfg.basis.max_basis {
+                args.max_basis = Some(n);
+                if args.verbose {
+                    eprintln!("  [config]   max_basis = {}", n);
                 }
             }
         }
@@ -448,10 +609,41 @@ fn main() -> Result<()> {
         eprintln!("  r_max = {:.2} Å  (user-specified)", r_max);
     }
 
-    let n_basis_user = args.n_basis.unwrap_or(20);
-    let basis = CubicBSpline::new(r_max, n_basis_user);
+    let basis_count = resolve_basis_count(&args, r_max)?;
+    let basis = CubicBSpline::new(r_max, basis_count.n_basis);
     if args.verbose {
-        eprintln!("  basis: cubic-b-spline  n_basis={}", n_basis_user);
+        match basis_count.source {
+            BasisCountSource::Explicit => {
+                if args.knot_spacing.is_some() {
+                    eprintln!(
+                        "  basis: cubic-b-spline  n_basis={}  (explicit; knot_spacing ignored)",
+                        basis_count.n_basis
+                    );
+                } else {
+                    eprintln!(
+                        "  basis: cubic-b-spline  n_basis={}  (explicit)",
+                        basis_count.n_basis
+                    );
+                }
+            }
+            BasisCountSource::KnotSpacing {
+                knot_spacing,
+                min_basis,
+                max_basis,
+                unclamped,
+            } => {
+                eprintln!(
+                    "  basis: cubic-b-spline  n_basis={}  (derived: ceil({:.2}/{:.4})={} clamped to [{}, {}])",
+                    basis_count.n_basis, r_max, knot_spacing, unclamped, min_basis, max_basis
+                );
+            }
+            BasisCountSource::Default => {
+                eprintln!(
+                    "  basis: cubic-b-spline  n_basis={}  (default)",
+                    basis_count.n_basis
+                );
+            }
+        }
     }
 
     // ---- 4 + 5. Build system and solve -----------------------------------
@@ -527,4 +719,118 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args_for_basis() -> Args {
+        Args {
+            input: PathBuf::from("data.dat"),
+            method: None,
+            lambda: None,
+            rmax: None,
+            n_basis: None,
+            knot_spacing: None,
+            min_basis: None,
+            max_basis: None,
+            lambda_count: 60,
+            lambda_min: None,
+            lambda_max: None,
+            negative_handling: NegativeHandling::Clip,
+            qmin: None,
+            qmax: None,
+            snr_cutoff: 0.0,
+            rebin: 0,
+            output: None,
+            fit_output: None,
+            verbose: false,
+        }
+    }
+
+    #[test]
+    fn basis_count_defaults_to_20() {
+        let args = args_for_basis();
+        let resolved = resolve_basis_count(&args, 150.0).unwrap();
+        assert_eq!(
+            resolved,
+            BasisCount {
+                n_basis: DEFAULT_N_BASIS,
+                source: BasisCountSource::Default
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_n_basis_wins_over_knot_spacing() {
+        let mut args = args_for_basis();
+        args.n_basis = Some(24);
+        args.knot_spacing = Some(7.5);
+        args.min_basis = Some(12);
+        args.max_basis = Some(48);
+
+        let resolved = resolve_basis_count(&args, 150.0).unwrap();
+        assert_eq!(
+            resolved,
+            BasisCount {
+                n_basis: 24,
+                source: BasisCountSource::Explicit
+            }
+        );
+    }
+
+    #[test]
+    fn knot_spacing_derives_basis_count_from_dmax() {
+        let mut args = args_for_basis();
+        args.knot_spacing = Some(7.5);
+        args.min_basis = Some(12);
+        args.max_basis = Some(48);
+
+        let resolved = resolve_basis_count(&args, 150.0).unwrap();
+        assert_eq!(
+            resolved,
+            BasisCount {
+                n_basis: 20,
+                source: BasisCountSource::KnotSpacing {
+                    knot_spacing: 7.5,
+                    min_basis: 12,
+                    max_basis: 48,
+                    unclamped: 20
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn knot_spacing_clamps_to_min_and_max() {
+        let mut args = args_for_basis();
+        args.knot_spacing = Some(10.0);
+        args.min_basis = Some(12);
+        args.max_basis = Some(48);
+
+        let min_clamped = resolve_basis_count(&args, 50.0).unwrap();
+        assert_eq!(min_clamped.n_basis, 12);
+
+        args.knot_spacing = Some(5.0);
+        let max_clamped = resolve_basis_count(&args, 400.0).unwrap();
+        assert_eq!(max_clamped.n_basis, 48);
+    }
+
+    #[test]
+    fn basis_resolution_rejects_invalid_values() {
+        let mut args = args_for_basis();
+        args.n_basis = Some(1);
+        assert!(resolve_basis_count(&args, 150.0).is_err());
+
+        args = args_for_basis();
+        args.knot_spacing = Some(0.0);
+        assert!(resolve_basis_count(&args, 150.0).is_err());
+
+        args = args_for_basis();
+        args.knot_spacing = Some(7.5);
+        args.min_basis = Some(50);
+        args.max_basis = Some(12);
+        assert!(resolve_basis_count(&args, 150.0).is_err());
+    }
 }

@@ -105,6 +105,22 @@ interior splines satisfy
 so P(r) is structurally zero at both boundaries without any additional
 constraint rows.
 
+### 3b  Basis resolution
+
+The primary resolution knob is the number of free spline coefficients,
+`n_basis`.  It can be supplied directly with `--n-basis` or `[basis].n_basis`.
+When no exact count is supplied, `--knot-spacing` or `[basis].knot_spacing`
+derives the count from Dmax:
+
+```
+n_basis = ceil(D_max / knot_spacing)
+```
+
+The derived count is clamped to `[min_basis, max_basis]`, defaulting to
+`[12, 48]` if those bounds are not supplied.  If neither `n_basis` nor
+`knot_spacing` is set, the fallback is `n_basis = 20`.  There is no hidden
+second pass or automatic Dmax refinement in this path.
+
 The kernel matrix entry
 
 ```

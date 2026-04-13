@@ -25,6 +25,9 @@ unfourier data.dat --method bayes --rmax 150 --output pr.dat --verbose
 # Choose the number of free cubic B-spline basis parameters
 unfourier data.dat --n-basis 20 --rmax 150 -o pr.dat
 
+# Or derive the basis count from Dmax with clamp bounds
+unfourier data.dat --knot-spacing 7.5 --min-basis 12 --max-basis 48 --rmax 150 -o pr.dat
+
 # Preprocessing options: q-range, SNR cutoff, log-rebinning
 unfourier data.dat --qmin 0.01 --qmax 0.35 --snr-cutoff 1.0 --rebin 200 -o pr.dat
 
@@ -43,6 +46,9 @@ python Dev/sweep_noise.py
 
 # M4 validation: Monte Carlo coverage check for Bayesian error bars
 python Dev/monte_carlo_coverage.py --n 200 --k 5
+
+# M8/Epic 5 validation: sweep n_basis and knot_spacing
+python Dev/sweep_knot_density.py
 ```
 
 ## Architecture

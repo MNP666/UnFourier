@@ -62,6 +62,9 @@ Options:
   --lambda <LAMBDA>          Regularisation strength (manual mode)
   --rmax <RMAX>              Maximum r in Å  [default: π / q_min]
   --n-basis <N>              Number of free cubic B-spline basis parameters
+  --knot-spacing <F>         Derive n_basis as ceil(rmax / spacing)
+  --min-basis <N>            Lower clamp for knot-spacing-derived n_basis
+  --max-basis <N>            Upper clamp for knot-spacing-derived n_basis
   --lambda-count <N>         Grid size for automatic search  [default: 60]
   --lambda-min <F>           Lower bound of λ search grid
   --lambda-max <F>           Upper bound of λ search grid
@@ -92,6 +95,9 @@ unfourier data.dat --rmax 150 --method bayes --output pr.dat --verbose
 # Choose the number of free B-spline basis parameters
 unfourier data.dat --rmax 150 --n-basis 20 --output pr.dat
 
+# Or derive the number of free parameters from Dmax
+unfourier data.dat --rmax 150 --knot-spacing 7.5 --min-basis 12 --max-basis 48 --output pr.dat
+
 # Manual λ
 unfourier data.dat --rmax 150 --lambda 0.01 --output pr.dat
 
@@ -118,12 +124,21 @@ qmax = 0.35             # Å⁻¹ — discard points above this q
 
 [basis]
 n_basis = 20            # number of free cubic B-spline basis parameters
+# Alternative when n_basis is absent:
+knot_spacing = 7.5      # derive n_basis = ceil(Dmax / knot_spacing)
+min_basis = 12          # lower clamp for derived n_basis
+max_basis = 48          # upper clamp for derived n_basis
 
 [constraints]
 # First-derivative slope penalty (combined with curvature regularisation)
 # -1 = disabled (default), 0 = weight 1.0, >0 = explicit weight
 d1_smoothness = -1.0
 ```
+
+Resolution rule: explicit `n_basis` wins over `knot_spacing`. If `n_basis` is
+absent and `knot_spacing` is set, unFourier uses `ceil(Dmax / knot_spacing)`
+clamped to `[min_basis, max_basis]`. If neither is set, the default is
+`n_basis = 20`.
 
 ### Input format
 
@@ -168,6 +183,7 @@ UnFourier/
 │   ├── gen_debye.py           # Generate synthetic Debye/Gaussian-chain data
 │   ├── plot_pr.py             # Plot P(r) output vs analytic reference
 │   ├── sweep_noise.py         # M3 validation: sweep noise, compare GCV/L-curve
+│   ├── sweep_knot_density.py  # M8/Epic 5 validation: n_basis and knot spacing
 │   ├── monte_carlo_coverage.py# M4 validation: Bayesian error bar coverage
 │   ├── parse_gnom.py          # Parse GNOM .out files for reference P(r)
 │   └── validate_real_data.py  # M7/M8 validation against SASDME2, SASDF42, SASDYU3
@@ -184,7 +200,7 @@ UnFourier/
 
 ## Architecture
 
-The pipeline in `main.rs` is: **parse → preprocess → build basis → build system → [constrain] → solve → output**.
+The pipeline in `main.rs` is: **parse → preprocess → build basis → build system → solve coefficients → evaluate spline P(r) → output**.
 
 Each stage is abstracted behind a trait, making the system extensible without modifying the pipeline:
 
