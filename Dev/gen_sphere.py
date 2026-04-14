@@ -23,7 +23,7 @@ Usage examples
     python gen_sphere.py --radius 50 --noise 0.05 --output sphere_noisy.dat
 
 # Smaller sphere, more q points, saved to stdout:
-    python gen_sphere.py --radius 30 --npoints 300 --qmin 0.005 --qmax 0.8
+    python gen_sphere.py --radius 30 --n-q 300 --qmin 0.005 --qmax 0.8
 """
 
 import argparse
@@ -78,7 +78,7 @@ def main() -> None:
         help="Maximum q in Å⁻¹ (default: 0.5)",
     )
     parser.add_argument(
-        "--npoints", type=int, default=200, metavar="N",
+        "--n-q", dest="n_q", type=int, default=200, metavar="N",
         help="Number of q points (default: 200)",
     )
     parser.add_argument(
@@ -106,9 +106,9 @@ def main() -> None:
 
     # q grid
     if args.log_spacing:
-        q = np.logspace(np.log10(args.qmin), np.log10(args.qmax), args.npoints)
+        q = np.logspace(np.log10(args.qmin), np.log10(args.qmax), args.n_q)
     else:
-        q = np.linspace(args.qmin, args.qmax, args.npoints)
+        q = np.linspace(args.qmin, args.qmax, args.n_q)
 
     # Analytic intensity, normalised to I(0) = 1
     intensity = sphere_intensity(q, args.radius)

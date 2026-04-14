@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::fs;
+use unfourier::basis::SplineBoundaryMode;
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -29,8 +30,10 @@ pub struct BasisConfig {
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ConstraintsConfig {
-    /// -1 = disabled, 0 = default relative weight 1.0, >0 = explicit relative weight
+    pub spline_boundary: Option<SplineBoundaryMode>,
+    /// -1 = disabled, 0 = default relative weight, >0 = explicit relative weight
     pub d1_smoothness: Option<f64>,
+    pub d2_smoothness: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -102,14 +105,26 @@ n_basis = 30
 knot_spacing = 7.5
 min_basis = 12
 max_basis = 48
+
+[constraints]
+spline_boundary = "value_slope_zero"
+d1_smoothness = 0.0
+d2_smoothness = 1.5
 "#;
         let cfg: UnfourierConfig = toml::from_str(text).unwrap();
         assert_eq!(cfg.regularisation.method.as_deref(), Some("lcurve"));
         assert_eq!(cfg.preprocessing.qmin, Some(0.01));
+        assert_eq!(cfg.preprocessing.negative_handling.as_deref(), Some("omit"));
         assert_eq!(cfg.basis.n_basis, Some(30));
         assert_eq!(cfg.basis.knot_spacing, Some(7.5));
         assert_eq!(cfg.basis.min_basis, Some(12));
         assert_eq!(cfg.basis.max_basis, Some(48));
+        assert_eq!(
+            cfg.constraints.spline_boundary,
+            Some(SplineBoundaryMode::ValueSlopeZero)
+        );
+        assert_eq!(cfg.constraints.d1_smoothness, Some(0.0));
+        assert_eq!(cfg.constraints.d2_smoothness, Some(1.5));
     }
 
     #[test]
@@ -164,21 +179,45 @@ max_basis = 48
     fn parse_constraints_toml() {
         let text = r#"
 [constraints]
+spline_boundary = "value_zero"
 d1_smoothness = -1.0
+d2_smoothness = 1.0
 "#;
         let cfg: UnfourierConfig = toml::from_str(text).unwrap();
+        assert_eq!(
+            cfg.constraints.spline_boundary,
+            Some(SplineBoundaryMode::ValueZero)
+        );
         assert_eq!(cfg.constraints.d1_smoothness, Some(-1.0));
+        assert_eq!(cfg.constraints.d2_smoothness, Some(1.0));
 
         // Explicit weight
         let text2 = r#"
 [constraints]
 d1_smoothness = 2.5
+d2_smoothness = 0.75
 "#;
         let cfg2: UnfourierConfig = toml::from_str(text2).unwrap();
         assert_eq!(cfg2.constraints.d1_smoothness, Some(2.5));
+        assert_eq!(cfg2.constraints.d2_smoothness, Some(0.75));
 
         // Absent section → all None
         let cfg3: UnfourierConfig = toml::from_str("").unwrap();
         assert!(cfg3.constraints.d1_smoothness.is_none());
+        assert!(cfg3.constraints.d2_smoothness.is_none());
+        assert!(cfg3.constraints.spline_boundary.is_none());
+    }
+
+    #[test]
+    fn invalid_spline_boundary_is_rejected() {
+        let text = r#"
+[constraints]
+spline_boundary = "clamped-ish"
+"#;
+        let err = toml::from_str::<UnfourierConfig>(text).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown variant"),
+            "unexpected error: {err}"
+        );
     }
 }

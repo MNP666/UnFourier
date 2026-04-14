@@ -121,6 +121,7 @@ lambda_max = 1e3        # upper bound of λ search grid
 [preprocessing]
 qmin = 0.01             # Å⁻¹ — discard points below this q
 qmax = 0.35             # Å⁻¹ — discard points above this q
+negative_handling = "clip"  # clip | omit | keep for non-positive I(q)
 
 [basis]
 n_basis = 20            # number of free cubic B-spline basis parameters
@@ -130,9 +131,14 @@ min_basis = 12          # lower clamp for derived n_basis
 max_basis = 48          # upper clamp for derived n_basis
 
 [constraints]
-# First-derivative slope penalty (combined with curvature regularisation)
-# -1 = disabled (default), 0 = weight 1.0, >0 = explicit weight
-d1_smoothness = -1.0
+spline_boundary = "value_zero"  # value_zero | value_slope_zero
+
+# First- and second-derivative penalties, applied in full spline coefficient
+# space and projected onto the free coefficients.
+# d1_smoothness: absent/0 = default 0.1, -1 = disabled, >0 = explicit weight
+# d2_smoothness: absent = 1.0, >=0 = explicit weight
+d1_smoothness = 0.0
+d2_smoothness = 1.0
 ```
 
 Resolution rule: explicit `n_basis` wins over `knot_spacing`. If `n_basis` is
@@ -169,8 +175,8 @@ UnFourier/
 │   ├── bspline.rs        # Cox–de Boor B-spline evaluation and quadrature (M5)
 │   ├── kernel.rs         # Weighted system matrix and back-calculation
 │   ├── solver.rs         # Solver trait, LeastSquaresSvd, TikhonovSolver
-│   ├── regularise.rs     # Regulariser trait + SecondDerivative, FirstDerivative,
-│   │                     #   CombinedDerivative (M8)
+│   ├── regularise.rs     # Regulariser trait + derivative penalties and
+│   │                     #   ProjectedSplineRegulariser
 │   ├── nonneg.rs         # NonNegativityStrategy trait, ProjectedGradient NNLS
 │   ├── lambda_select.rs  # LambdaSelector trait, GCV, L-curve, BayesianEvidence,
 │   │                     #   GridMatrices, evaluate_lambda_grid
@@ -182,10 +188,12 @@ UnFourier/
 │   ├── gen_sphere.py          # Generate synthetic sphere SAXS data
 │   ├── gen_debye.py           # Generate synthetic Debye/Gaussian-chain data
 │   ├── plot_pr.py             # Plot P(r) output vs analytic reference
-│   ├── sweep_noise.py         # M3 validation: sweep noise, compare GCV/L-curve
+│   ├── sweep_noise.py         # Spline noise, n_basis, and smoothness sweeps
+│   ├── sweep_smoothness.py    # Epic 4 validation: d1/d2 smoothness sweep
 │   ├── sweep_knot_density.py  # M8/Epic 5 validation: n_basis and knot spacing
-│   ├── monte_carlo_coverage.py# M4 validation: Bayesian error bar coverage
+│   ├── monte_carlo_coverage.py# Bayesian spline error-bar coverage
 │   ├── parse_gnom.py          # Parse GNOM .out files for reference P(r)
+│   ├── validate_spline.py     # Spline-only synthetic regression checks
 │   └── validate_real_data.py  # M7/M8 validation against SASDME2, SASDF42, SASDYU3
 ├── data/
 │   └── dat_ref/               # Reference SAXS datasets (SASDME2, SASDF42, SASDYU3)
@@ -209,7 +217,7 @@ Each stage is abstracted behind a trait, making the system extensible without mo
 | `data.rs` | — | `SaxsData`: holds q, I(q), σ(q); parses 3-column `.dat` files |
 | `basis.rs` | `BasisSet` | `CubicBSpline` (clamped B-splines) |
 | `kernel.rs` | — | `build_weighted_system`, `back_calculate` |
-| `regularise.rs` | `Regulariser` | `SecondDerivative`, `FirstDerivative`, `CombinedDerivative` |
+| `regularise.rs` | `Regulariser` | `SecondDerivative`, `FirstDerivative`, `CombinedDerivative`, `ProjectedSplineRegulariser` |
 | `solver.rs` | `Solver` | `LeastSquaresSvd` (M1), `TikhonovSolver` (M2+) |
 | `lambda_select.rs` | `LambdaSelector` | `GcvSelector`, `LCurveSelector`, `BayesianEvidence` |
 | `nonneg.rs` | `NonNegativityStrategy` | `ProjectedGradient` (NNLS), `NoConstraint` |
@@ -242,6 +250,9 @@ python Dev/gen_debye.py --rg 30 --k 5 --output Dev/debye_k5.dat \
 Run the full validation suite with:
 
 ```bash
+python Dev/validate_spline.py
+python Dev/sweep_noise.py
+python Dev/monte_carlo_coverage.py --n 200 --k 5 --n-basis 20
 python Dev/validate_real_data.py
 ```
 

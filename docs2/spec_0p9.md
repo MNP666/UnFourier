@@ -476,7 +476,7 @@ Tasks:
 2. Run:
 
    ```bash
-   rg -e "UniformGrid|BasisChoice|--basis|--npoints|rect" src README.md CLAUDE.md pipeline.md Dev
+   rg -e "UniformGrid|BasisChoice|--basis|--npoints|\\brect\\b|rectangular" src README.md CLAUDE.md pipeline.md Dev
    rg -e "append_boundary_constraints|boundary_weight" src README.md CLAUDE.md pipeline.md
    ```
 
@@ -525,4 +525,3 @@ Acceptance:
 4. Should knot spacing become the default over fixed `n_basis` after validation?
 5. How should Dmax be inferred for a future two-pass solve without chasing noise
    tails?
-

@@ -81,29 +81,26 @@ P(r) is represented as a finite linear combination of basis functions φ_j(r):
 P(r) ≈ Σ_j  c_j · φ_j(r)
 ```
 
-The project now uses cubic B-splines as the active basis. The old rectangular
+The project now uses cubic B-splines as the active basis. The old top-hat
 histogram basis was useful for the first vertical slice, but it cannot produce
 smooth endpoint behaviour and is no longer part of the active CLI.
 
 ### 3a  Cubic B-splines
 
-P(r) is represented on a clamped knot vector.  For n free parameters, the code
-builds n + 2 B-splines on the knot vector
+P(r) is represented on a clamped cubic knot vector.  The solver sees `n_basis`
+free coefficients, but the spline basis internally expands those into a larger
+full coefficient vector with fixed zero entries at the boundaries:
 
-```
-[0, 0, 0, 0,  t_1, …, t_{n-3},  D_max, D_max, D_max, D_max]
-```
+| Boundary mode | Full coefficient vector |
+|---------------|--------------------------|
+| `value_zero` (default) | `[0, c..., 0]` |
+| `value_slope_zero` | `[0, 0, c..., 0, 0]` |
 
-and then **drops the two endpoint basis functions** B_0 and B_{n+1} (which are
-the only ones non-zero at r = 0 and r = D_max respectively).  The remaining n
-interior splines satisfy
-
-```
-φ_j(0) = 0   and   φ_j(D_max) = 0   for all j ∈ {1, …, n}
-```
-
-so P(r) is structurally zero at both boundaries without any additional
-constraint rows.
+The knot vector is sized for that full coefficient vector, and then the kernel,
+regulariser, and output evaluator are all projected through the same
+free-to-full map.  This makes P(r) structurally zero at both boundaries without
+additional constraint rows or post-solve output edits.  The `value_slope_zero`
+mode also makes the clamped cubic spline derivative vanish at both endpoints.
 
 ### 3b  Basis resolution
 
@@ -171,8 +168,19 @@ weighting entirely separate from regularisation.
 
 For the current spline basis, endpoint values are represented structurally. The
 clamped knot vector contains endpoint B-splines that are non-zero at r = 0 and
-r = D_max; the active `CubicBSpline` implementation drops those endpoint columns
-from the kernel, so no free coefficient can make P(0) or P(D_max) non-zero.
+r = D_max; `CubicBSpline` builds the full clamped basis and then projects it
+through a free-to-full coefficient map.
+
+Two boundary modes are available through `[constraints].spline_boundary`:
+
+| Mode | Full coefficient vector |
+|------|--------------------------|
+| `value_zero` (default) | `[0, c..., 0]` |
+| `value_slope_zero` | `[0, 0, c..., 0, 0]` |
+
+The same map is used for kernel construction, regularisation, and output
+evaluation, so fixed boundary coefficients cannot contribute to either I(q) or
+the published P(r).
 
 M8 Epic 2 removes post-hoc output mutation: the solver returns coefficients,
 and the output stage evaluates those coefficients on a dense spline grid.
@@ -193,7 +201,7 @@ min_c  ‖K_w c − I_w‖²  +  λ_eff · ‖L c‖²
 
 The regularisation matrix L encodes the physics we want to enforce.
 
-### 6a  Second-derivative penalty (default)
+### 6a  Second-derivative penalty
 
 `SecondDerivative` produces the (n−2) × n finite-difference matrix D₂:
 
@@ -219,14 +227,17 @@ Minimising ‖D₁ c‖² penalises slope — it penalises large step changes be
 adjacent coefficients, targeting single-step discontinuities that the curvature penalty
 misses.
 
-### 6c  Combined penalty (M8)
+### 6c  Projected combined penalty
 
-`CombinedDerivative { d1_weight, d2_weight }` stacks both matrices with
-per-component weights:
+`ProjectedSplineRegulariser { boundary_mode, d1_weight, d2_weight }` first
+builds the combined derivative penalty in full clamped-spline coefficient space,
+then projects it through the same boundary map as the kernel:
 
 ```
 L_combined = [ sqrt(d₁) · D₁ ]      shape: (2n−3) × n
              [ sqrt(d₂) · D₂ ]
+
+L_free = L_combined · B
 ```
 
 so that:
@@ -236,8 +247,18 @@ so that:
 ```
 
 When d₁ = 0, d₂ = 1 the combined matrix reduces exactly to `SecondDerivative`
-— no regression.  Enabled via `[constraints] d1_smoothness = 0` in
-`unfourier.toml`.
+in the full coefficient space. The user-facing smoothness controls are:
+
+| Field | Meaning |
+|-------|---------|
+| `d1_smoothness` absent or `0` | default neighboring-coefficient penalty, currently `0.1` |
+| `d1_smoothness = -1` | disable D1 while keeping D2 active |
+| `d1_smoothness > 0` | explicit D1 weight |
+| `d2_smoothness` absent | default curvature penalty, `1.0` |
+| `d2_smoothness >= 0` | explicit D2 weight |
+
+At least one of D1 or D2 must be active; otherwise λ scaling has no
+regularisation trace to scale against.
 
 ---
 
@@ -335,7 +356,10 @@ covariance:
 Σ_post = (KᵀK + λ_eff LᵀL)⁻¹
 ```
 
-from which per-r uncertainty bars σ_P(r) = sqrt(Σ_post[j,j]) are extracted.
+The implementation currently extracts marginal coefficient standard deviations
+from the posterior diagonal and propagates them to the dense spline output grid
+through the basis functions. This is a diagonal approximation; full posterior
+covariance propagation can be added later if needed.
 
 ### 7d  Manual
 
@@ -472,8 +496,8 @@ parameterisation rather than appended rows.
                             │
               ┌─────────────▼───────────────┐
               │  REGULARISER                 │
-              │  L = D₂ (curvature, default) │
-              │    or sqrt(d₁)D₁ ⊕ sqrt(d₂)D₂│
+              │  L = sqrt(d₁)D₁ ⊕ sqrt(d₂)D₂│
+              │  projected through spline map │
               │  LᵀL = gram_matrix(n)        │
               └─────────────┬───────────────┘
                             │

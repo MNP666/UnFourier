@@ -96,7 +96,7 @@ def main() -> None:
         help="Maximum q in Å⁻¹ (default: 0.5)",
     )
     parser.add_argument(
-        "--npoints", type=int, default=200, metavar="N",
+        "--n-q", dest="n_q", type=int, default=200, metavar="N",
         help="Number of q points (default: 200)",
     )
     parser.add_argument(
@@ -127,9 +127,9 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
 
     if args.log_spacing:
-        q = np.logspace(np.log10(args.qmin), np.log10(args.qmax), args.npoints)
+        q = np.logspace(np.log10(args.qmin), np.log10(args.qmax), args.n_q)
     else:
-        q = np.linspace(args.qmin, args.qmax, args.npoints)
+        q = np.linspace(args.qmin, args.qmax, args.n_q)
 
     I = debye_intensity(q, args.rg)
 

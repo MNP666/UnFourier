@@ -1,5 +1,128 @@
 use crate::bspline;
 use nalgebra::DMatrix;
+use serde::Deserialize;
+
+/// Boundary constraints enforced by fixing full clamped-spline coefficients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SplineBoundaryMode {
+    /// Fix only the endpoint coefficients: `[0, c..., 0]`.
+    ValueZero,
+    /// Fix endpoint and boundary-adjacent coefficients: `[0, 0, c..., 0, 0]`.
+    ValueSlopeZero,
+}
+
+impl Default for SplineBoundaryMode {
+    fn default() -> Self {
+        Self::ValueZero
+    }
+}
+
+impl std::fmt::Display for SplineBoundaryMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ValueZero => write!(f, "value_zero"),
+            Self::ValueSlopeZero => write!(f, "value_slope_zero"),
+        }
+    }
+}
+
+impl SplineBoundaryMode {
+    fn first_free_index(self) -> usize {
+        match self {
+            Self::ValueZero => 1,
+            Self::ValueSlopeZero => 2,
+        }
+    }
+
+    fn fixed_coefficients(self) -> usize {
+        2 * self.first_free_index()
+    }
+}
+
+/// Mapping between solved free coefficients and the full clamped spline vector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplineCoefficientMap {
+    mode: SplineBoundaryMode,
+    n_free: usize,
+    n_full: usize,
+    first_free: usize,
+}
+
+impl SplineCoefficientMap {
+    pub fn new(n_free: usize, mode: SplineBoundaryMode) -> Self {
+        assert!(
+            n_free >= 2,
+            "spline coefficient map requires at least 2 free coefficients, got {}",
+            n_free
+        );
+        let first_free = mode.first_free_index();
+        let n_full = n_free + mode.fixed_coefficients();
+        Self {
+            mode,
+            n_free,
+            n_full,
+            first_free,
+        }
+    }
+
+    pub fn mode(&self) -> SplineBoundaryMode {
+        self.mode
+    }
+
+    pub fn n_free(&self) -> usize {
+        self.n_free
+    }
+
+    pub fn n_full(&self) -> usize {
+        self.n_full
+    }
+
+    pub fn full_index(&self, free_index: usize) -> usize {
+        assert!(
+            free_index < self.n_free,
+            "free coefficient index {} out of range 0..{}",
+            free_index,
+            self.n_free
+        );
+        self.first_free + free_index
+    }
+
+    pub fn expand(&self, free_coeffs: &[f64]) -> Vec<f64> {
+        assert_eq!(
+            free_coeffs.len(),
+            self.n_free,
+            "free coefficient count must match the spline coefficient map"
+        );
+        let mut full = vec![0.0_f64; self.n_full];
+        for (j, &c) in free_coeffs.iter().enumerate() {
+            full[self.full_index(j)] = c;
+        }
+        full
+    }
+
+    pub fn project_columns(&self, full: &DMatrix<f64>) -> DMatrix<f64> {
+        assert_eq!(
+            full.ncols(),
+            self.n_full,
+            "full matrix column count must match the spline coefficient map"
+        );
+        DMatrix::from_fn(full.nrows(), self.n_free, |i, j| {
+            full[(i, self.full_index(j))]
+        })
+    }
+
+    pub fn project_values(&self, full_values: &[f64]) -> Vec<f64> {
+        assert_eq!(
+            full_values.len(),
+            self.n_full,
+            "full value count must match the spline coefficient map"
+        );
+        (0..self.n_free)
+            .map(|j| full_values[self.full_index(j)])
+            .collect()
+    }
+}
 
 /// A set of basis functions for representing P(r).
 ///
@@ -58,94 +181,109 @@ pub trait BasisSet: Send + Sync {
 
 /// Cubic B-spline basis on `[0, r_max]` with zero boundary conditions.
 ///
-/// P(r) is represented as a linear combination of `n_basis` interior cubic
-/// B-spline functions.  The two endpoint B-splines (B_0 at r=0, B_{n-1} at
-/// r=r_max) are **excluded** from the design matrix; their coefficients are
-/// implicitly zero, which enforces P(0) = P(r_max) = 0 by construction.
+/// P(r) is represented as a linear combination of `n_basis` free cubic
+/// B-spline coefficients.  Boundary conditions are enforced by embedding those
+/// free coefficients in the full clamped spline coefficient vector with fixed
+/// zero coefficients at the ends.
 ///
 /// ```text
-/// P(r) = Σ_{j=1}^{n_basis}  c_j · B_j(r)   (B_0 and B_{n+1} dropped)
+/// value_zero:       [0, c..., 0]
+/// value_slope_zero: [0, 0, c..., 0, 0]
 /// ```
 ///
-/// Endpoint values P(0)=P(r_max)=0 are enforced by the parameterisation.  The
-/// solved coefficients are spline control weights, not sampled P(r) values;
-/// output must be produced with [`BasisSet::evaluate_pr`].
+/// Endpoint values P(0)=P(r_max)=0 are enforced by both modes.  The
+/// `value_slope_zero` mode also fixes the boundary-adjacent coefficients,
+/// giving zero endpoint slope for the clamped cubic spline. The solved
+/// coefficients are spline control weights, not sampled P(r) values; output
+/// must be produced with [`BasisSet::evaluate_pr`].
 ///
 /// # Parameters
 ///
 /// `n_basis` is the number of **free** (interior) parameters.
-/// The underlying knot vector uses `n_basis - 2` interior knots.
+/// The underlying knot vector uses enough uniformly spaced interior knots to
+/// provide those free parameters plus the fixed boundary coefficients required
+/// by the selected boundary mode.
 /// The default recommended value is `n_basis = 20`.
 pub struct CubicBSpline {
     knots: Vec<f64>,
-    /// Greville abscissae of the n_basis INTERIOR basis functions only
-    /// (B_1 … B_{n_basis}, excluding the two endpoint functions).
-    r_interior: Vec<f64>,
+    coeff_map: SplineCoefficientMap,
+    /// Greville abscissae of the free basis functions only.
+    r_free: Vec<f64>,
     r_max: f64,
 }
 
 impl CubicBSpline {
     /// Create a cubic B-spline basis on `[0, r_max]` with `n_basis` free parameters.
+    pub fn new(r_max: f64, n_basis: usize) -> Self {
+        Self::with_boundary_mode(r_max, n_basis, SplineBoundaryMode::default())
+    }
+
+    /// Create a cubic B-spline basis with an explicit boundary mode.
     ///
     /// Interior knots are placed uniformly.  The returned basis has `n_basis`
-    /// columns (interior B-splines B_1 … B_{n_basis} only; the two endpoint
-    /// B-splines are excluded so that P(0)=P(r_max)=0 holds by construction).
+    /// free columns; the full clamped spline has additional fixed zero
+    /// coefficients according to `boundary_mode`.
     ///
     /// # Panics
     ///
     /// Panics if `r_max <= 0` or `n_basis < 2`.
-    pub fn new(r_max: f64, n_basis: usize) -> Self {
+    pub fn with_boundary_mode(
+        r_max: f64,
+        n_basis: usize,
+        boundary_mode: SplineBoundaryMode,
+    ) -> Self {
         assert!(r_max > 0.0, "r_max must be positive");
         assert!(n_basis >= 2, "n_basis must be at least 2");
 
-        let n_interior = n_basis - 2;
+        let coeff_map = SplineCoefficientMap::new(n_basis, boundary_mode);
+        let n_interior = coeff_map.n_full() - 4;
         let knots = bspline::clamped_knots(r_max, n_interior);
 
-        // All Greville abscissae (n_basis + 2 total), then keep only the
-        // interior ones (indices 1..n_basis+1), dropping the two endpoints.
         let all_greville = bspline::greville(&knots, 3);
-        let r_interior = all_greville[1..all_greville.len() - 1].to_vec();
+        let r_free = coeff_map.project_values(&all_greville);
 
         Self {
             knots,
-            r_interior,
+            coeff_map,
+            r_free,
             r_max,
         }
     }
 
-    /// Basis matrix for the free interior spline coefficients only.
+    pub fn boundary_mode(&self) -> SplineBoundaryMode {
+        self.coeff_map.mode()
+    }
+
+    pub fn coefficient_map(&self) -> &SplineCoefficientMap {
+        &self.coeff_map
+    }
+
+    /// Basis matrix for the free spline coefficients only.
     fn free_basis_matrix(&self, r: &[f64]) -> DMatrix<f64> {
         let full = bspline::basis_matrix(&self.knots, 3, r);
-        let n_cols = full.ncols();
-        let n_free = n_cols - 2;
-        DMatrix::from_fn(full.nrows(), n_free, |i, j| full[(i, j + 1)])
+        self.coeff_map.project_columns(&full)
     }
 }
 
 impl BasisSet for CubicBSpline {
     fn r_values(&self) -> &[f64] {
-        &self.r_interior
+        &self.r_free
     }
 
     fn r_max(&self) -> f64 {
         self.r_max
     }
 
-    /// K_ij = 4π ∫ B_j(r) sin(q_i r)/(q_i r) dr   for the n_basis INTERIOR
-    /// basis functions (B_1 … B_{n_basis}).
-    ///
-    /// The two endpoint columns (B_0 and B_{n_basis+1}) are dropped because
-    /// their coefficients are implicitly zero (P(0)=P(r_max)=0 by construction).
-    /// The returned matrix has shape `(n_q × n_basis)`.
+    /// K_ij = 4π ∫ B_j(r) sin(q_i r)/(q_i r) dr for the free spline
+    /// coefficients. Fixed boundary coefficients are projected out through the
+    /// shared coefficient map.
     fn build_kernel_matrix(&self, q: &[f64]) -> DMatrix<f64> {
         let full = bspline::sinc_kernel_matrix(&self.knots, 3, q);
-        let n_cols = full.ncols(); // n_basis + 2
-        let n_free = n_cols - 2; // n_basis
-        DMatrix::from_fn(full.nrows(), n_free, |i, j| full[(i, j + 1)])
+        self.coeff_map.project_columns(&full)
     }
 
     fn output_grid(&self) -> Vec<f64> {
-        let n_intervals = (self.r_interior.len() * 10).max(200);
+        let n_intervals = (self.r_free.len() * 10).max(200);
         (0..=n_intervals)
             .map(|i| self.r_max * i as f64 / n_intervals as f64)
             .collect()
@@ -193,14 +331,44 @@ impl BasisSet for CubicBSpline {
 mod tests {
     use super::*;
 
+    #[test]
+    fn value_zero_mapping_expands_free_coefficients() {
+        let map = SplineCoefficientMap::new(3, SplineBoundaryMode::ValueZero);
+        assert_eq!(map.n_free(), 3);
+        assert_eq!(map.n_full(), 5);
+        assert_eq!(map.expand(&[1.0, 2.0, 3.0]), vec![0.0, 1.0, 2.0, 3.0, 0.0]);
+    }
+
+    #[test]
+    fn value_slope_zero_mapping_expands_free_coefficients() {
+        let map = SplineCoefficientMap::new(3, SplineBoundaryMode::ValueSlopeZero);
+        assert_eq!(map.n_free(), 3);
+        assert_eq!(map.n_full(), 7);
+        assert_eq!(
+            map.expand(&[1.0, 2.0, 3.0]),
+            vec![0.0, 0.0, 1.0, 2.0, 3.0, 0.0, 0.0]
+        );
+    }
+
     /// n_basis free parameters → correct kernel dimensions.
     #[test]
     fn cubic_bspline_dimensions() {
         let bs = CubicBSpline::new(150.0, 20);
-        // Interior only: n_basis = 20 (endpoint B-splines dropped)
         assert_eq!(bs.n_basis(), 20);
         assert_eq!(bs.r_values().len(), 20);
         assert_eq!(bs.r_max(), 150.0);
+
+        let q: Vec<f64> = (1..=50).map(|i| i as f64 * 0.01).collect();
+        let k = bs.build_kernel_matrix(&q);
+        assert_eq!(k.nrows(), 50);
+        assert_eq!(k.ncols(), 20);
+    }
+
+    #[test]
+    fn value_slope_zero_keeps_same_free_kernel_shape() {
+        let bs = CubicBSpline::with_boundary_mode(150.0, 20, SplineBoundaryMode::ValueSlopeZero);
+        assert_eq!(bs.n_basis(), 20);
+        assert_eq!(bs.coefficient_map().n_full(), 24);
 
         let q: Vec<f64> = (1..=50).map(|i| i as f64 * 0.01).collect();
         let k = bs.build_kernel_matrix(&q);
@@ -271,6 +439,26 @@ mod tests {
         assert!(
             p.iter().any(|&v| v > 0.0),
             "non-zero coefficients should produce non-zero interior P(r)"
+        );
+    }
+
+    #[test]
+    fn value_slope_zero_output_has_flat_endpoints() {
+        let bs = CubicBSpline::with_boundary_mode(100.0, 8, SplineBoundaryMode::ValueSlopeZero);
+        let coeffs: Vec<f64> = (1..=8).map(|i| i as f64).collect();
+        let eps = 1e-4_f64;
+        let r = vec![0.0, eps, 100.0 - eps, 100.0];
+        let p = bs.evaluate_pr(&coeffs, &r);
+
+        assert!(p[0].abs() < 1e-12, "P(0) must be exactly zero");
+        assert!(p[3].abs() < 1e-12, "P(Dmax) must be exactly zero");
+        assert!(
+            ((p[1] - p[0]) / eps).abs() < 1e-4,
+            "left endpoint slope should be near zero"
+        );
+        assert!(
+            ((p[3] - p[2]) / eps).abs() < 1e-4,
+            "right endpoint slope should be near zero"
         );
     }
 

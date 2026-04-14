@@ -1,31 +1,39 @@
 # CODEX.md
 
-This note is a strategy for fixing the M8 boundary problem in unFourier: fitted
+This note began as the strategy for fixing the M8 boundary problem in unFourier: fitted
 I(q) can look acceptable while the reported P(r) is not physical at r = 0 and
 r = D_max. The target is not just "make the first and last plotted values zero";
 the target is that the fitted real-space function itself goes to zero in a
 smooth, model-consistent way.
 
+The 0.9 implementation now follows this strategy: the active product surface is
+cubic B-spline only, solver output is stored as coefficients, P(r) is evaluated
+on a dense spline grid for publication, boundary modes are represented through a
+free-to-full coefficient map, and the projected regulariser uses that same map.
+Sections below that mention the older top-hat basis or removed CLI flags are
+historical cleanup notes, not active user-facing workflow.
+
 ## Diagnosis
 
-The current failure comes from mixing three different objects:
+The original failure came from mixing three different objects:
 
 1. The coefficient vector `c` solved by the optimizer.
 2. The real-space function `P(r) = sum_j c_j phi_j(r)`.
 3. The sampled output table written as `r, P(r)`.
 
-The rectangular basis used to hide this distinction because coefficients are bin
+The historical top-hat basis used to hide this distinction because coefficients are bin
 heights. That was useful for the first vertical slice, but it is not a physical
 production basis. For the B-spline basis, coefficients are spline control
 weights, not exact P(r) samples. Writing spline coefficients directly as P(r) can
 make the output look non-physical even when the spline expansion is better
 behaved than the table suggests.
 
-There is also a more direct bug in the current M8 path: `main.rs` inserts
-boundary rows and then hard-sets the first and last interior `solution.p_r`
-values to zero after the solve. That creates a visible step in the output and
-also makes `solution.p_r` inconsistent with `solution.i_calc`, because the
-back-calculated fit was computed from the pre-clamped coefficients.
+There was also a more direct bug in the pre-0.9 M8 path: `main.rs` inserted
+boundary rows and then hard-set the first and last interior `solution.p_r`
+values to zero after the solve. That created a visible step in the output and
+made `solution.p_r` inconsistent with `solution.i_calc`, because the
+back-calculated fit was computed from the pre-clamped coefficients. The 0.9 path
+evaluates P(r) from the final coefficients instead.
 
 The important rule for M8 is therefore:
 
@@ -52,10 +60,10 @@ P'(0) = 0
 P'(D_max) = 0
 ```
 
-This stronger condition should be built into the spline basis. The rectangular
-basis should be removed rather than patched further.
+This stronger condition is built into the spline parameterisation when
+`spline_boundary = "value_slope_zero"` is selected.
 
-## Preferred Solution
+## Implemented Solution
 
 Separate "solve coefficients" from "output samples".
 
@@ -177,7 +185,7 @@ many basis functions let the solution express local wiggles unless regularisatio
 is strong enough. The right control is often not an absolute count, but a target
 real-space resolution, such as "one spline control region every 5-8 Angstrom".
 
-Add an optional knot-spacing control before attempting any two-pass Dmax
+The implementation adds an optional knot-spacing control before attempting any two-pass Dmax
 refinement:
 
 ```toml
@@ -220,9 +228,12 @@ That second pass should wait until the simpler knot-spacing option has been
 validated, because Dmax inference needs careful thresholds and can be fooled by
 regularisation tails or noise.
 
-## Implementation Plan
+## Historical Implementation Plan
 
-1. Remove the rectangular basis from the active code path.
+This checklist is kept as implementation history. The active 0.9 CLI and
+validation scripts are spline-only.
+
+1. Remove the historical top-hat basis from the active code path.
 
    Delete `UniformGrid` from `src/basis.rs`. Remove `BasisChoice`, the `--basis`
    flag, and the `--npoints` flag from `src/main.rs`. Construct `CubicBSpline`
@@ -289,7 +300,7 @@ regularisation tails or noise.
    Remove or de-emphasise `boundary_weight` if hard coefficient elimination is
    used. A hard basis constraint is easier to reason about than pseudo-data rows.
 
-9. Remove rectangular validation comparisons.
+9. Remove historical basis-comparison validation.
 
    Update the validation scripts so spline is the only active run. Historical
    notes can keep mentioning rectangles, but active scripts should not require a
@@ -378,10 +389,10 @@ shims.
    Remove rect runs, rect plots, and pass/fail summaries labelled "rect". Keep a
    single spline result per dataset, plus optional rebin variants where useful.
 
-2. `Dev/validate_m5.py`
+2. `Dev/validate_spline.py`
 
-   Retire or rewrite this as a spline regression script. The old purpose was to
-   prove splines beat rectangles; that question is closed. New checks should be:
+   Use this as the spline regression script. The old comparison-oriented
+   validator has been retired; the current checks should be:
 
    ```text
    spline output endpoints are zero
@@ -396,9 +407,8 @@ shims.
 
 4. `Dev/monte_carlo_coverage.py`
 
-   This script currently assumes the rectangular kernel/grid. Either rewrite its
-   reference grid around spline evaluation or temporarily mark it as retired
-   until Bayesian coverage is revalidated for splines.
+   This script validates the emitted spline output grid. It should not construct
+   an internal removed-basis grid or pass removed grid-size CLI options.
 
 ### Docs
 
@@ -430,7 +440,7 @@ Before calling the removal done, these commands should return no active source
 or README hits except historical docs or generated plots:
 
 ```bash
-rg -e "UniformGrid|BasisChoice|--basis|--npoints|rect" src README.md CLAUDE.md pipeline.md Dev
+rg -e "UniformGrid|BasisChoice|--basis|--npoints|\brect\b|rectangular" src README.md CLAUDE.md pipeline.md Dev
 rg -e "append_boundary_constraints|boundary_weight" src README.md CLAUDE.md pipeline.md
 ```
 
@@ -498,8 +508,8 @@ M8 is done when:
 3. The plotted P(r) is the evaluated spline function, not the raw coefficient
    vector.
 4. `I_calc` and output P(r) are derived from the same solved coefficients.
-5. The active CLI and docs no longer expose or recommend rectangular bins.
-6. `rg -e "UniformGrid|BasisChoice|--basis|--npoints|rect" src README.md CLAUDE.md pipeline.md Dev`
+5. The active CLI and docs no longer expose or recommend removed basis options.
+6. `rg -e "UniformGrid|BasisChoice|--basis|--npoints|\brect\b|rectangular" src README.md CLAUDE.md pipeline.md Dev`
    has no active-code hits.
 7. `--knot-spacing` and `[basis].knot_spacing` choose a sensible clamped
    `n_basis` from Dmax, while explicit `--n-basis` still wins.

@@ -1,11 +1,11 @@
 mod config;
 
 use anyhow::{anyhow, Result};
-use clap::{Parser, ValueEnum};
+use clap::{parser::ValueSource, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use std::path::PathBuf;
 
 use unfourier::{
-    basis::{BasisSet, CubicBSpline},
+    basis::{BasisSet, CubicBSpline, SplineBoundaryMode},
     data::{parse_dat, SaxsData},
     kernel::build_weighted_system,
     lambda_select::{
@@ -14,7 +14,7 @@ use unfourier::{
     },
     output::{print_summary, write_fit_to_file, write_pr_to_file, write_pr_to_stdout, PrCurve},
     preprocess::{ClipNegative, LogRebin, OmitNonPositive, Preprocessor, QRangeSelector},
-    regularise::{BoundaryAnchoredCombined, Regulariser},
+    regularise::{ProjectedSplineRegulariser, Regulariser},
     solver::{Solution, Solver, TikhonovSolver},
 };
 
@@ -35,6 +35,15 @@ enum NegativeHandling {
     Keep,
 }
 
+fn parse_negative_handling_config(value: &str) -> Result<NegativeHandling> {
+    NegativeHandling::from_str(value, true).map_err(|_| {
+        anyhow!(
+            "unfourier.toml: unknown preprocessing.negative_handling '{}'; expected one of: clip, omit, keep",
+            value
+        )
+    })
+}
+
 /// How to choose the regularisation strength λ.
 #[derive(Debug, Clone, ValueEnum)]
 enum Method {
@@ -52,6 +61,8 @@ const DEFAULT_N_BASIS: usize = 20;
 const DEFAULT_MIN_BASIS: usize = 12;
 const DEFAULT_MAX_BASIS: usize = 48;
 const MIN_N_BASIS: usize = 2;
+const DEFAULT_D1_SMOOTHNESS: f64 = 0.1;
+const DEFAULT_D2_SMOOTHNESS: f64 = 1.0;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -274,6 +285,56 @@ fn validate_basis_options(args: &Args) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Smoothness resolution
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SmoothnessWeights {
+    d1_weight: f64,
+    d2_weight: f64,
+}
+
+fn resolve_smoothness_weights(
+    d1_smoothness: Option<f64>,
+    d2_smoothness: Option<f64>,
+) -> Result<SmoothnessWeights> {
+    let d1_weight = match d1_smoothness {
+        None => DEFAULT_D1_SMOOTHNESS,
+        Some(v) if v == -1.0 => 0.0,
+        Some(v) if v == 0.0 => DEFAULT_D1_SMOOTHNESS,
+        Some(v) if v.is_finite() && v > 0.0 => v,
+        Some(v) => {
+            return Err(anyhow!(
+                "unfourier.toml: constraints.d1_smoothness must be -1, 0, or a positive finite value, got {}",
+                v
+            ));
+        }
+    };
+
+    let d2_weight = match d2_smoothness {
+        None => DEFAULT_D2_SMOOTHNESS,
+        Some(v) if v.is_finite() && v >= 0.0 => v,
+        Some(v) => {
+            return Err(anyhow!(
+                "unfourier.toml: constraints.d2_smoothness must be a non-negative finite value, got {}",
+                v
+            ));
+        }
+    };
+
+    if d1_weight == 0.0 && d2_weight == 0.0 {
+        return Err(anyhow!(
+            "unfourier.toml: at least one of d1_smoothness or d2_smoothness must be active"
+        ));
+    }
+
+    Ok(SmoothnessWeights {
+        d1_weight,
+        d2_weight,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Solve helper
 // ---------------------------------------------------------------------------
 
@@ -384,16 +445,20 @@ fn run_solve(
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<()> {
-    let mut args = Args::parse();
+    let matches = Args::command().get_matches();
+    let cli_negative_handling =
+        matches.value_source("negative_handling") == Some(ValueSource::CommandLine);
+    let mut args = Args::from_arg_matches(&matches)?;
     let cli_n_basis = args.n_basis.is_some();
     let cli_knot_spacing = args.knot_spacing.is_some();
 
     // ---- 0. Load optional TOML config and fill unset CLI args ---------------
-    // d1_weight: relative weight for the first-derivative penalty in the
-    // boundary-anchored combined regulariser.
-    // -1 = second-derivative curvature only (default). 0.0 = 1.0. positive = explicit.
-    let mut d1_weight: f64 = 0.0;
-    let mut use_d1 = false;
+    // Smoothness weights for the projected spline regulariser.
+    // D1: absent or 0 = default, -1 = disabled, >0 = explicit.
+    // D2: absent = default, >=0 = explicit.
+    let mut d1_smoothness: Option<f64> = None;
+    let mut d2_smoothness: Option<f64> = None;
+    let mut spline_boundary = SplineBoundaryMode::default();
 
     if let Some(cfg) = config::UnfourierConfig::load()? {
         if args.verbose {
@@ -450,9 +515,14 @@ fn main() -> Result<()> {
                 }
             }
         }
-        // negative_handling has a clap default so we can't distinguish
-        // "user set" vs "default" purely from Option; skip override to keep
-        // CLI default behaviour unchanged.
+        if !cli_negative_handling {
+            if let Some(ref v) = cfg.preprocessing.negative_handling {
+                args.negative_handling = parse_negative_handling_config(v)?;
+                if args.verbose {
+                    eprintln!("  [config]   negative_handling = {}", v);
+                }
+            }
+        }
         // [basis]
         if !cli_n_basis && !cli_knot_spacing && args.n_basis.is_none() {
             if let Some(n) = cfg.basis.n_basis {
@@ -488,17 +558,27 @@ fn main() -> Result<()> {
         }
 
         // [constraints]
-        if let Some(d1) = cfg.constraints.d1_smoothness {
-            if d1 >= 0.0 {
-                use_d1 = true;
-                d1_weight = if d1 == 0.0 { 1.0 } else { d1 };
-                if args.verbose {
-                    eprintln!("  [config]   d1_smoothness = {}", d1);
-                }
+        if let Some(mode) = cfg.constraints.spline_boundary {
+            spline_boundary = mode;
+            if args.verbose {
+                eprintln!("  [config]   spline_boundary = {}", mode);
             }
-            // d1 < 0 (i.e. -1) → disabled; use_d1 stays false
+        }
+        if let Some(d1) = cfg.constraints.d1_smoothness {
+            d1_smoothness = Some(d1);
+            if args.verbose {
+                eprintln!("  [config]   d1_smoothness = {}", d1);
+            }
+        }
+        if let Some(d2) = cfg.constraints.d2_smoothness {
+            d2_smoothness = Some(d2);
+            if args.verbose {
+                eprintln!("  [config]   d2_smoothness = {}", d2);
+            }
         }
     }
+
+    let smoothness = resolve_smoothness_weights(d1_smoothness, d2_smoothness)?;
 
     // Resolve the effective method: explicit --method, or infer from --lambda.
     let method = match (&args.method, args.lambda) {
@@ -610,19 +690,21 @@ fn main() -> Result<()> {
     }
 
     let basis_count = resolve_basis_count(&args, r_max)?;
-    let basis = CubicBSpline::new(r_max, basis_count.n_basis);
+    let basis = CubicBSpline::with_boundary_mode(r_max, basis_count.n_basis, spline_boundary);
     if args.verbose {
         match basis_count.source {
             BasisCountSource::Explicit => {
                 if args.knot_spacing.is_some() {
                     eprintln!(
-                        "  basis: cubic-b-spline  n_basis={}  (explicit; knot_spacing ignored)",
-                        basis_count.n_basis
+                        "  basis: cubic-b-spline  n_basis={}  boundary={}  (explicit; knot_spacing ignored)",
+                        basis_count.n_basis,
+                        basis.boundary_mode()
                     );
                 } else {
                     eprintln!(
-                        "  basis: cubic-b-spline  n_basis={}  (explicit)",
-                        basis_count.n_basis
+                        "  basis: cubic-b-spline  n_basis={}  boundary={}  (explicit)",
+                        basis_count.n_basis,
+                        basis.boundary_mode()
                     );
                 }
             }
@@ -633,14 +715,21 @@ fn main() -> Result<()> {
                 unclamped,
             } => {
                 eprintln!(
-                    "  basis: cubic-b-spline  n_basis={}  (derived: ceil({:.2}/{:.4})={} clamped to [{}, {}])",
-                    basis_count.n_basis, r_max, knot_spacing, unclamped, min_basis, max_basis
+                    "  basis: cubic-b-spline  n_basis={}  boundary={}  (derived: ceil({:.2}/{:.4})={} clamped to [{}, {}])",
+                    basis_count.n_basis,
+                    basis.boundary_mode(),
+                    r_max,
+                    knot_spacing,
+                    unclamped,
+                    min_basis,
+                    max_basis
                 );
             }
             BasisCountSource::Default => {
                 eprintln!(
-                    "  basis: cubic-b-spline  n_basis={}  (default)",
-                    basis_count.n_basis
+                    "  basis: cubic-b-spline  n_basis={}  boundary={}  (default)",
+                    basis_count.n_basis,
+                    basis.boundary_mode()
                 );
             }
         }
@@ -648,29 +737,21 @@ fn main() -> Result<()> {
 
     // ---- 4 + 5. Build system and solve -----------------------------------
 
-    // Build the boundary-anchored regulariser once.
-    // BoundaryAnchoredCombined assumes c[-1]=c[n]=0 and penalises the slopes
-    // c[0] and c[n-1] (boundary-adjacent bins) from/to those fixed zeros.
-    // This eliminates the competition between soft boundary constraints and the
-    // regulariser that plagued the old ghost-coefficient approach.
+    // Build the spline regulariser once. It starts in full clamped coefficient
+    // space, then projects through the same free-to-full coefficient map as the
+    // kernel and output evaluator.
     let n_basis = basis.r_values().len();
-    let reg: Box<dyn Regulariser> = if use_d1 {
-        if args.verbose {
-            eprintln!(
-                "  [constraints] regulariser: boundary-anchored-combined  d1={:.2}  d2=1.00",
-                d1_weight
-            );
-        }
-        Box::new(BoundaryAnchoredCombined {
-            d1_weight,
-            d2_weight: 1.0,
-        })
-    } else {
-        Box::new(BoundaryAnchoredCombined {
-            d1_weight: 0.0,
-            d2_weight: 1.0,
-        })
-    };
+    if args.verbose {
+        eprintln!(
+            "  [constraints] regulariser: projected-spline-derivative  boundary={}  d1={:.2}  d2={:.2}",
+            spline_boundary, smoothness.d1_weight, smoothness.d2_weight
+        );
+    }
+    let reg: Box<dyn Regulariser> = Box::new(ProjectedSplineRegulariser {
+        boundary_mode: spline_boundary,
+        d1_weight: smoothness.d1_weight,
+        d2_weight: smoothness.d2_weight,
+    });
     let ltl = reg.gram_matrix(n_basis);
 
     let solution = run_solve(&data, &basis, &method, &args, args.verbose, ltl, reg)?;
@@ -763,6 +844,36 @@ mod tests {
     }
 
     #[test]
+    fn negative_handling_config_parses_known_values() {
+        assert!(matches!(
+            parse_negative_handling_config("clip").unwrap(),
+            NegativeHandling::Clip
+        ));
+        assert!(matches!(
+            parse_negative_handling_config("omit").unwrap(),
+            NegativeHandling::Omit
+        ));
+        assert!(matches!(
+            parse_negative_handling_config("keep").unwrap(),
+            NegativeHandling::Keep
+        ));
+        assert!(matches!(
+            parse_negative_handling_config("OMIT").unwrap(),
+            NegativeHandling::Omit
+        ));
+    }
+
+    #[test]
+    fn negative_handling_config_rejects_unknown_values() {
+        let err = parse_negative_handling_config("nonnegative-pr").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unknown preprocessing.negative_handling"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn explicit_n_basis_wins_over_knot_spacing() {
         let mut args = args_for_basis();
         args.n_basis = Some(24);
@@ -832,5 +943,62 @@ mod tests {
         args.min_basis = Some(50);
         args.max_basis = Some(12);
         assert!(resolve_basis_count(&args, 150.0).is_err());
+    }
+
+    #[test]
+    fn smoothness_defaults_enable_d1_and_d2() {
+        let weights = resolve_smoothness_weights(None, None).unwrap();
+        assert_eq!(
+            weights,
+            SmoothnessWeights {
+                d1_weight: DEFAULT_D1_SMOOTHNESS,
+                d2_weight: DEFAULT_D2_SMOOTHNESS,
+            }
+        );
+    }
+
+    #[test]
+    fn smoothness_d1_minus_one_disables_only_d1() {
+        let weights = resolve_smoothness_weights(Some(-1.0), None).unwrap();
+        assert_eq!(
+            weights,
+            SmoothnessWeights {
+                d1_weight: 0.0,
+                d2_weight: DEFAULT_D2_SMOOTHNESS,
+            }
+        );
+    }
+
+    #[test]
+    fn smoothness_d1_zero_uses_default_weight() {
+        let weights = resolve_smoothness_weights(Some(0.0), Some(2.0)).unwrap();
+        assert_eq!(
+            weights,
+            SmoothnessWeights {
+                d1_weight: DEFAULT_D1_SMOOTHNESS,
+                d2_weight: 2.0,
+            }
+        );
+    }
+
+    #[test]
+    fn smoothness_positive_values_are_explicit_weights() {
+        let weights = resolve_smoothness_weights(Some(0.25), Some(0.75)).unwrap();
+        assert_eq!(
+            weights,
+            SmoothnessWeights {
+                d1_weight: 0.25,
+                d2_weight: 0.75,
+            }
+        );
+    }
+
+    #[test]
+    fn smoothness_rejects_invalid_values() {
+        assert!(resolve_smoothness_weights(Some(-0.5), None).is_err());
+        assert!(resolve_smoothness_weights(Some(f64::NAN), None).is_err());
+        assert!(resolve_smoothness_weights(None, Some(-1.0)).is_err());
+        assert!(resolve_smoothness_weights(None, Some(f64::INFINITY)).is_err());
+        assert!(resolve_smoothness_weights(Some(-1.0), Some(0.0)).is_err());
     }
 }
