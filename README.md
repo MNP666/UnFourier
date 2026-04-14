@@ -1,12 +1,18 @@
 # unFourier
 
+**Work in progress.** The current project version is **0.9**. The codebase is
+usable for experimentation, but it is not yet a validated analysis tool.
+Version **1.0** will be the first version where at least one regularisation /
+selection method, such as GCV, L-curve, Bayesian evidence, or a manual workflow,
+is validated well enough to be considered a working recommended path.
+
 A Rust implementation of Indirect Fourier Transformation (IFT) for Small Angle X-ray Scattering (SAXS) data.
 
 ---
 
 ## Goals
 
-**SAXS IFT in Rust.** unFourier recovers the pair distance distribution function P(r) from a measured scattering curve I(q). This is an ill-posed inverse problem: the kernel is a Fredholm integral equation of the first kind, and regularisation is essential to prevent the solution from fitting noise. The project implements and compares several approaches — Tikhonov regularisation with manual λ, automatic selection via GCV and L-curve, and Bayesian evidence maximisation — all operating on the same clean pipeline.
+**SAXS IFT in Rust.** unFourier explores recovery of the pair distance distribution function P(r) from a measured scattering curve I(q). This is an ill-posed inverse problem: the kernel is a Fredholm integral equation of the first kind, and regularisation is essential to prevent the solution from fitting noise. The project implements and compares several approaches — Tikhonov regularisation with manual λ, automatic selection via GCV and L-curve, and Bayesian evidence maximisation — all operating on the same clean pipeline.
 
 **Flexible and extensible by design.** The pipeline is built around a small set of traits (`BasisSet`, `Solver`, `Regulariser`, `LambdaSelector`, `Preprocessor`) so that components can be swapped or extended without restructuring the rest of the code. Want to try a new λ selection strategy? Implement `LambdaSelector`. The interfaces are more important than the initial implementations.
 
@@ -20,16 +26,22 @@ A Rust implementation of Indirect Fourier Transformation (IFT) for Small Angle X
 
 ## Status
 
-| Milestone | Description | Status |
-|-----------|-------------|--------|
-| M1 | Naive least-squares, end-to-end pipeline | ✅ Done |
-| M2 | Tikhonov regularisation with manual λ | ✅ Done |
-| M3 | Automatic λ selection (GCV, L-curve) | ✅ Done |
-| M4 | Bayesian IFT with posterior error bars | ✅ Done |
-| M5 | Cubic B-spline basis functions | ✅ Done |
-| M6 | Full preprocessing pipeline (rebinning, q-range, SNR trimming) | ✅ Done |
-| M7 | Real-data validation and GCV robustness (GCV-fallback, NNLS) | ✅ Done |
-| M8 | Perceptual constraints (boundary enforcement, combined regulariser) | ✅ Done |
+Current version: **0.9**.
+
+The milestone features are implemented as code paths, but M3-M8 should still be
+treated as work in progress. The next goal is not to add more surface area, but
+to validate and harden at least one method into a reliable 1.0 workflow.
+
+| Milestone | Description | Current state |
+|-----------|-------------|---------------|
+| M1 | Naive least-squares, end-to-end pipeline | Baseline implemented |
+| M2 | Tikhonov regularisation with manual λ | Baseline implemented |
+| M3 | Automatic λ selection (GCV, L-curve) | Implemented, validation in progress |
+| M4 | Bayesian IFT with posterior error bars | Implemented, calibration in progress |
+| M5 | Cubic B-spline basis functions | Implemented, behaviour still being validated |
+| M6 | Full preprocessing pipeline (rebinning, q-range, SNR trimming) | Implemented, policy still being validated |
+| M7 | Real-data validation and GCV robustness (GCV-fallback, NNLS) | Implemented as exploratory validation |
+| M8 | Perceptual constraints (boundary enforcement, combined regulariser) | Implemented, tuning and validation in progress |
 
 See [MILESTONES.md](MILESTONES.md) for the full plan and rationale.
 
@@ -275,6 +287,7 @@ python Dev/validate_real_data.py
 - **GNOM** (D. I. Svergun, 1992) and the ATSAS package for establishing the mathematical framework for IFT of SAXS data.
 - **BayesApp** (S. Hansen, 2012) for the Bayesian evidence-maximisation approach that inspired M4.
 - **Claude** (Anthropic) as a coding and mathematics partner throughout development.
+- **Codex / ChatGPT** (OpenAI) as a coding, documentation, and validation partner.
 
 ---
 
