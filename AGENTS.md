@@ -1,112 +1,237 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+This file is the quick project brief for coding agents working in this
+repository. It should be kept current and compact. Longer diagnostic notes live
+in `docs2/`, especially `docs2/CODEX.md` for the historical M8 boundary analysis
+and `docs2/spec_0p10.md` for the next planned iteration.
 
 ## Project Overview
 
-**unFourier** is a Rust implementation of Indirect Fourier Transformation (IFT) for Small Angle X-ray Scattering (SAXS) data analysis. It recovers the pair distance distribution function P(r) from measured scattering curves I(q) — an ill-posed inverse problem solved via Tikhonov regularisation with automatic λ selection (GCV, L-curve, or manual).
+**unFourier** is a Rust implementation of Indirect Fourier Transformation (IFT)
+for SAXS data. It recovers the pair-distance distribution function `P(r)` from a
+measured scattering curve `I(q)`. This is an ill-posed inverse problem, solved as
+a Tikhonov-regularised linear system with automatic lambda selection by GCV,
+L-curve, or Bayesian evidence.
 
-## Commands
+The current active model is spline-only:
+
+```text
+P(r) = sum_j c_j B_j(r)
+```
+
+The solver estimates spline coefficients `c_j`; output `P(r)` is then evaluated
+on a dense real-space grid. Do not treat spline coefficients as sampled `P(r)`.
+
+## Core Commands
 
 ```bash
 # Build
 cargo build --release
-# Binary at target/release/unfourier
+# Binary: target/release/unfourier
 
-# Run with GCV (default)
-unfourier data.dat --rmax 150 --output pr.dat --fit-output fit.dat --verbose
+# Default GCV run
+target/release/unfourier data.dat --rmax 150 --output pr.dat --fit-output fit.dat --verbose
 
-# Run with specific method
-unfourier data.dat --method lcurve --rmax 100 -o pr.dat
+# Specific lambda-selection method
+target/release/unfourier data.dat --method lcurve --rmax 100 -o pr.dat
+target/release/unfourier data.dat --method bayes --rmax 150 -o pr.dat --verbose
 
-# Run Bayesian IFT (produces 3-column output: r, P(r), σ_P(r))
-unfourier data.dat --method bayes --rmax 150 --output pr.dat --verbose
+# Manual lambda
+target/release/unfourier data.dat --method manual --lambda 0.01 --rmax 150 -o pr.dat
 
-# Use cubic B-spline basis (M5) instead of rectangular bins
-unfourier data.dat --basis spline --n-basis 20 --rmax 150 -o pr.dat
+# Spline basis controls
+target/release/unfourier data.dat --n-basis 20 --rmax 150 -o pr.dat
+target/release/unfourier data.dat --knot-spacing 7.5 --min-basis 12 --max-basis 48 --rmax 150 -o pr.dat
 
-# Preprocessing options: q-range, SNR cutoff, log-rebinning
-unfourier data.dat --qmin 0.01 --qmax 0.35 --snr-cutoff 1.0 --rebin 200 -o pr.dat
+# Preprocessing controls
+target/release/unfourier data.dat --qmin 0.01 --qmax 0.35 --snr-cutoff 1.0 --rebin 200 -o pr.dat
 
-# TOML config file (unfourier.toml in CWD) overrides unset CLI args
-# Sections: [regularisation], [preprocessing], [basis], [constraints]
+# Real-data validation against GNOM references
+python3 Dev/validate_real_data.py
 
-# Generate synthetic test fixtures (requires numpy, matplotlib, scipy)
-python Dev/gen_debye.py        # Noisy Debye chain data (primary benchmark)
-python Dev/gen_sphere.py       # Sphere data (kernel accuracy, not noisy tests)
-
-# Plot P(r) vs reference
-python Dev/plot_pr.py
-
-# M3 validation: sweep noise levels across GCV/L-curve
-python Dev/sweep_noise.py
-
-# M4 validation: Monte Carlo coverage check for Bayesian error bars
-python Dev/monte_carlo_coverage.py --n 200 --k 5
+# Synthetic and exploratory validation
+python3 Dev/gen_debye.py
+python3 Dev/gen_sphere.py
+python3 Dev/validate_spline.py
+python3 Dev/sweep_noise.py
+python3 Dev/sweep_smoothness.py
+python3 Dev/sweep_knot_density.py
+python3 Dev/monte_carlo_coverage.py --n 200 --k 5 --n-basis 20
 ```
 
-## Architecture
+`unfourier.toml` is loaded from the current working directory and fills unset CLI
+options. CLI flags take precedence over TOML values. This matters for validation:
+`Dev/validate_real_data.py` defaults to running `unfourier` from the repo root via
+`--config-dir`, so the root `unfourier.toml` is used unless the script is told
+otherwise.
 
-The pipeline in `main.rs` is: **parse → preprocess → r-grid → build kernel → solve → boundary projection → output**.
+## Pipeline
 
-Each stage is abstracted behind a trait, making the system extensible without modifying the pipeline:
+The binary pipeline in `src/main.rs` is:
 
-| Module | Trait | Current Implementation |
-|--------|-------|------------------------|
-| `data.rs` | — | `SaxsData`: holds q, I(q), σ(q); parses 3-column `.dat` files |
-| `basis.rs` | `BasisSet` | `UniformGrid` (rect bins); `CubicBSpline` (M5, interior B-splines with implicit zero endpoints) |
-| `bspline.rs` | — | Clamped knot vectors, B-spline evaluation, sinc kernel integration |
-| `kernel.rs` | — | Builds weighted system matrix K from basis + data |
-| `regularise.rs` | `Regulariser` | `BoundaryAnchoredCombined`: D̃₁ + D̃₂ with zero-boundary anchoring; also `SecondDerivative`, `FirstDerivative`, `CombinedDerivative` |
-| `solver.rs` | `Solver` | `TikhonovSolver`: SVD-based with L-curve curvature analysis |
-| `lambda_select.rs` | `LambdaSelector` | `GcvSelector`, `LCurveSelector`, `BayesianEvidence` |
-| `nonneg.rs` | `NonNegativityStrategy` | `IterativeClipping`: re-solves with zero-clamped bins |
-| `preprocess.rs` | `Preprocessor` | `ClipNegative`, `OmitNonPositive`, `QRangeSelector` (q-range + SNR cutoff), `LogRebin` |
-| `config.rs` | — | `UnfourierConfig`: TOML config from `unfourier.toml` (overrides unset CLI flags) |
-| `output.rs` | — | Writes P(r) and back-calculated I(q) fit |
+```text
+parse .dat
+-> preprocess data
+-> choose rmax and spline basis
+-> build weighted kernel
+-> solve spline coefficients
+-> evaluate spline P(r) on dense output grid
+-> write P(r) and optional I(q) fit
+```
 
-**Key design principles:**
-- Trait interfaces designed so future work slots in without touching the pipeline
-- Library uses `thiserror` for typed errors; binary uses `anyhow`
-- Each λ evaluation is a pure function — designed for `rayon::par_iter()` when needed
-- `[constraints] d1_smoothness` in `unfourier.toml` enables the first-derivative boundary term
+Preprocessing order is:
 
-## Milestones
+```text
+negative handling
+-> q-range / SNR filtering
+-> log rebinning
+```
 
-| M | Feature | Status |
-|---|---------|--------|
-| M1 | Naive least-squares end-to-end | ✅ |
-| M2 | Tikhonov with manual λ | ✅ |
-| M3 | Automatic λ (GCV + L-curve) | ✅ |
-| M4 | Bayesian IFT with error bars | ✅ |
-| M5 | Cubic B-spline basis | ✅ |
-| M6 | Full preprocessing pipeline (log-rebin, q-range, SNR, negative handling) | ✅ |
-| M7 | Boundary-anchored regulariser + TOML config | ✅ |
-| M8 | Smooth zero boundary conditions P(0)=P(D_max)=0 | 🔴 in progress |
+The planned 0.10 Guinier preflight should run after negative handling and before
+`QRangeSelector`.
 
-## Open Issue: M8 — Smooth boundary conditions
+## Module Map
 
-**Problem:** P(r) at r=0 and r=D_max should go smoothly to zero. The current approach cannot achieve this simultaneously for both:
+| Module | Role |
+|--------|------|
+| `src/data.rs` | `SaxsData`; lenient 3-column `.dat` parser for `q`, `I(q)`, `sigma` |
+| `src/basis.rs` | `BasisSet`; active `CubicBSpline`; boundary modes and free-to-full coefficient map |
+| `src/bspline.rs` | Clamped knot vectors, Greville points, B-spline evaluation, sinc-kernel integration |
+| `src/kernel.rs` | Builds weighted systems from data and basis |
+| `src/regularise.rs` | `Regulariser`; projected spline D1/D2 smoothness, plus derivative helpers |
+| `src/solver.rs` | Tikhonov solve for manual lambda; Cholesky/LU linear solve plus projected-gradient NNLS |
+| `src/lambda_select.rs` | GCV, L-curve, Bayesian evidence grid search; stores selected constrained solution |
+| `src/nonneg.rs` | Non-negativity strategies: projected-gradient NNLS default, `NoConstraint` available internally |
+| `src/preprocess.rs` | Negative handling, q-range/SNR selector, log rebinning |
+| `src/config.rs` | TOML config structs with `deny_unknown_fields` |
+| `src/output.rs` | Writes evaluated `P(r)` and back-calculated `I(q)` fit |
 
-- **Without hard zeroing:** The interior bins adjacent to the boundary take non-zero values — P(r) is non-zero at the edges.
-- **With hard zeroing** (post-hoc zero-clamp of first/last interior bin): P(r) hits zero at the boundary point but is discontinuous — the interior bins just inside are finite, so the curve steps to zero rather than sloping to zero.
+## Solver Details
 
-**Current approach (not fully solving the problem):**
-1. `BoundaryAnchoredCombined` regulariser: penalises the slope of c[0] from/to the implicit zero boundary (c[-1]=0, c[n]=0), intended to discourage non-zero boundary-adjacent values via smooth regularisation pressure.
-2. Post-hoc insertion of explicit (r=0, P=0) and (r=D_max, P=0) rows in the output.
-3. Hard zero-clamp of the first and last interior coefficient after solve (`p_r[1] = 0.0`, `p_r[last-1] = 0.0` in `main.rs:549–550`).
+For a fixed user-facing lambda, unFourier solves:
 
-**Root cause:** The piecewise-constant (rect) basis can only go to zero at the boundary if the nearest bin has exactly zero value — there's no smooth interpolation. The cubic B-spline basis has the same problem unless the endpoint B-splines are excluded and clamped correctly. Zeroing interior bins post-hoc creates a visible discontinuity at one bin inward from the boundary.
+```text
+(K^T K + lambda_eff L^T L) c = K^T I
+lambda_eff = lambda_user * tr(K^T K) / tr(L^T L)
+```
 
-**Candidate approaches still to explore:**
-- For the rect basis: enforce zero through the regulariser alone (no hard clamp) and accept a soft boundary that regularisation pushes down but cannot enforce exactly.
-- For splines: verify that dropping the endpoint B-splines (as currently done in `CubicBSpline`) truly forces P(0)=P(D_max)=0 exactly — and whether the derivative condition is also met.
-- Add explicit boundary constraint rows to the design matrix (augmented least-squares) rather than a post-hoc clamp.
-- Switch from bin-centre representation to a basis that naturally interpolates to zero at both endpoints.
+The code conceptually computes `c = A^-1 b`, but it does not invert `A`.
+Automatic lambda evaluation and manual solves use Cholesky where possible, with
+LU fallback in the manual helper. The final production solution is constrained
+with projected-gradient NNLS, so current CLI output is `P(r) >= 0`, not a signed
+contrast-variation solution.
+
+For automatic methods, GCV/L-curve/evidence quantities are computed from the
+unconstrained linear solution because those criteria assume a linear estimator.
+The stored solution for the selected lambda is the non-negativity-constrained
+coefficient vector.
+
+## Spline and Boundary Rules
+
+The old top-hat/rectangular basis is historical. Active code should not re-add
+`--basis`, `--npoints`, `UniformGrid`, or rect-vs-spline validation paths unless
+there is a deliberate new design.
+
+The key M8 lesson from `docs2/CODEX.md`:
+
+```text
+Do not edit reported P(r) after solving unless I(q) is recomputed from the same
+coefficients. Prefer constraints in the basis/linear system over post-hoc edits.
+```
+
+Current spline boundary modes:
+
+```text
+value_zero       -> full coefficients [0, c..., 0]
+value_slope_zero -> full coefficients [0, 0, c..., 0, 0]
+```
+
+The same free-to-full mapping must be used for:
+
+1. Kernel columns.
+2. Regularisation.
+3. Output evaluation.
+
+`Solution.coeffs` are spline control weights. Published `P(r)` comes from
+`basis.evaluate_pr(&solution.coeffs, &output_grid)`.
+
+## Config Notes
+
+Main TOML sections:
+
+```toml
+[regularisation]
+method = "gcv"       # gcv | lcurve | bayes | manual
+lambda_min = 1e0     # lower bound for automatic search grid
+lambda_max = 1e3
+
+[preprocessing]
+qmin = 0.01
+qmax = 0.35
+negative_handling = "clip"  # clip | omit | keep
+
+[basis]
+n_basis = 20
+knot_spacing = 7.5
+min_basis = 12
+max_basis = 48
+
+[constraints]
+spline_boundary = "value_zero"  # value_zero | value_slope_zero
+d1_smoothness = 0.1             # absent/0 = default, -1 = off, >0 = explicit
+d2_smoothness = 1.0             # absent = default, >=0 = explicit
+```
+
+Important precedence:
+
+1. CLI values win.
+2. TOML fills only unset CLI options.
+3. Built-in defaults apply last.
+
+`lambda_min` and `lambda_max` affect only automatic lambda methods. They do not
+affect `--method manual --lambda ...`.
 
 ## Validation Notes
 
-- **Debye chain** (`Dev/gen_debye.py`) is the primary noisy benchmark. Use this for validating regularisation and λ selection.
-- **Sphere** (`Dev/gen_sphere.py`) is used only for kernel accuracy tests (analytic P(r) is exact). It is **unsuitable for noisy-data validation** because the proportional noise model diverges near zeros of I(q) — see `saxs_ift_postmortem.md` for the full analysis.
-- **Bayesian error bars** (`--method bayes`) produce a 3-column P(r) output. Calibration is checked via `Dev/monte_carlo_coverage.py` — expect ~60–68% coverage at ±1σ; systematic under-coverage reflects regularisation bias not captured by the posterior.
-- There is no formal test suite; validation is done via the Python scripts in `Dev/`.
+Use `Dev/validate_real_data.py` for the current five real-data fixtures in
+`data/dat_ref` and `data/prs_ref`. The script discovers matching `.dat`/`.out`
+pairs, writes both `P(r)` and fit files, and produces `Dev/validation_plot.png`
+with `P(r)`, `I(q)` fit, and endpoint diagnostics.
+
+Use Debye-chain synthetic data as the primary noisy benchmark. Use sphere data
+only for kernel/evaluation sanity checks; proportional noise around sphere-form
+factor zeros makes it unsuitable as a regularisation benchmark.
+
+Bayesian error bars are written as a third `P(r)` column for `--method bayes`.
+The current posterior helper exposes diagonal coefficient standard deviations
+and does not include regularisation bias, so coverage is expected to be imperfect.
+
+## Current / Next Iteration
+
+0.9 resolved the main spline boundary architecture:
+
+1. Spline-only active basis.
+2. Coefficients separated from evaluated `P(r)`.
+3. No post-solve boundary clamping.
+4. Boundary conditions represented in the spline coefficient map.
+5. Projected D1/D2 regularisation through the same map.
+
+0.10 planning is in `docs2/spec_0p10.md`. The next feature is a Guinier low-q
+preflight:
+
+1. Report-only scan over increasing low-q truncations.
+2. Optional `--auto-qmin guinier` mutation mode.
+3. Explicit `--qmin` must win over automatic suggestions.
+4. No promise that automatic trimming is generally reliable before 1.0.
+
+## Development Cautions
+
+1. Keep changes scoped; this repo is exploratory but the current spline path is
+   coherent.
+2. Do not restore historical rect-basis product surfaces by accident.
+3. Do not mutate output `P(r)` independently of the solved coefficients.
+4. Be careful with `unfourier.toml` in the current working directory when running
+   validation or comparing lambda behavior.
+5. Preserve typed library errors where practical; the binary can use `anyhow`.
+6. Prefer adding focused tests for math helpers and use Python scripts for broader
+   numerical validation.

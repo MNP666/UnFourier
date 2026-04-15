@@ -2,5 +2,5 @@
 d1_smoothness = 1
 
 [regularisation]
-lambda_min = 1e-2
-method = 'gcv'
+lambda_min =  0.5
+method = 'bayes'
