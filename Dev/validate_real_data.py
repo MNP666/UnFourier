@@ -7,8 +7,10 @@ For each real SAXS dataset with a matching GNOM .out reference, this script:
   1. Parses Dmax and Rg from the GNOM output.
   2. Runs unFourier with the active cubic B-spline CLI.
   3. Optionally runs rebin variants for large datasets.
-  4. Reports ISE, Rg agreement, chi2, endpoint values, endpoint slopes, and runtime.
-  5. Saves a comparison plot with P(r), I(q) fit, and endpoint diagnostics.
+  4. Optionally exercises Guinier report-only and applied auto-qmin modes.
+  5. Reports ISE, Rg agreement, chi2, endpoint values, endpoint slopes, and runtime.
+  6. Records Guinier recommendations, applied qmin values, and point counts.
+  7. Saves a comparison plot with P(r), I(q) fit, and endpoint diagnostics.
 
 The script intentionally relies only on the current spline CLI surface.
 """
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import time
@@ -46,10 +49,26 @@ DEFAULT_REBIN_THRESHOLD = 1000
 
 
 @dataclass
+class GuinierRunInfo:
+    mode: str
+    recommended_qmin: float | None = None
+    recommended_skip: int | None = None
+    previous_qmin: float | None = None
+    applied_qmin: float | None = None
+    no_stable_recommendation: bool = False
+    report_text: str = ""
+    report_path: Path | None = None
+
+
+@dataclass
 class RunResult:
     dataset: str
     variant: str
+    guinier_mode: str
     rebin: int
+    raw_points: int
+    fit_points: int
+    guinier: GuinierRunInfo
     elapsed_s: float
     ise: float
     rg_unfourier: float
@@ -93,6 +112,51 @@ def count_data_points(dat_file: Path) -> int:
     return n
 
 
+def parse_guinier_info(stderr: str, mode: str) -> GuinierRunInfo:
+    info = GuinierRunInfo(mode=mode)
+    lines = stderr.splitlines()
+    try:
+        start = next(idx for idx, line in enumerate(lines) if line.startswith("Guinier scan:"))
+    except StopIteration:
+        return info
+
+    report_lines: list[str] = []
+    for line in lines[start:]:
+        report_lines.append(line)
+        if line.startswith("Guinier recommendation:"):
+            break
+    info.report_text = "\n".join(report_lines)
+
+    recommendation = report_lines[-1] if report_lines else ""
+    if "no stable recommendation" in recommendation:
+        info.no_stable_recommendation = True
+        return info
+
+    rec_match = re.search(
+        r"Guinier recommendation: qmin = ([0-9.eE+-]+) \(skip ([0-9]+)\)",
+        recommendation,
+    )
+    if rec_match:
+        info.recommended_qmin = float(rec_match.group(1))
+        info.recommended_skip = int(rec_match.group(2))
+
+    applied_match = re.search(
+        r"applied: low-q edge ([0-9.eE+-]+) -> ([0-9.eE+-]+)",
+        recommendation,
+    )
+    if applied_match:
+        info.previous_qmin = float(applied_match.group(1))
+        info.applied_qmin = float(applied_match.group(2))
+
+    return info
+
+
+def guinier_output_tag(variant: str, guinier_mode: str) -> str:
+    if guinier_mode == "off":
+        return variant
+    return f"{variant}_guinier-{guinier_mode}"
+
+
 def run_unfourier(
     binary: Path,
     dat_file: Path,
@@ -103,10 +167,12 @@ def run_unfourier(
     method: str,
     n_basis: int,
     rebin: int,
+    guinier_mode: str,
     config_dir: Path,
-) -> tuple[np.ndarray, np.ndarray, float]:
-    pr_path = outdir / f"{dataset}_{variant}_pr.dat"
-    fit_path = outdir / f"{dataset}_{variant}_fit.dat"
+) -> tuple[np.ndarray, np.ndarray, float, GuinierRunInfo]:
+    output_tag = guinier_output_tag(variant, guinier_mode)
+    pr_path = outdir / f"{dataset}_{output_tag}_pr.dat"
+    fit_path = outdir / f"{dataset}_{output_tag}_fit.dat"
     cmd = [
         str(binary),
         str(dat_file),
@@ -125,6 +191,10 @@ def run_unfourier(
     ]
     if rebin > 0:
         cmd += ["--rebin", str(rebin)]
+    if guinier_mode in {"report", "apply"}:
+        cmd += ["--guinier-report"]
+    if guinier_mode == "apply":
+        cmd += ["--auto-qmin", "guinier"]
 
     t0 = time.perf_counter()
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=config_dir)
@@ -144,7 +214,14 @@ def run_unfourier(
     fit = np.loadtxt(fit_path, comments="#")
     if fit.ndim != 2 or fit.shape[1] < 4:
         raise RuntimeError(f"unfourier produced malformed fit output: {fit_path}")
-    return pr[:, :2], fit[:, :4], elapsed
+
+    guinier = parse_guinier_info(result.stderr, guinier_mode)
+    if guinier.report_text:
+        report_path = outdir / f"{dataset}_{output_tag}_guinier.txt"
+        report_path.write_text(guinier.report_text + "\n")
+        guinier.report_path = report_path
+
+    return pr[:, :2], fit[:, :4], elapsed, guinier
 
 
 def rg_from_pr(r: np.ndarray, pr: np.ndarray) -> float:
@@ -190,7 +267,10 @@ def chi_squared_from_fit(fit: np.ndarray) -> float:
 def make_result(
     dataset: str,
     variant: str,
+    guinier_mode: str,
     rebin: int,
+    raw_points: int,
+    guinier: GuinierRunInfo,
     pr: np.ndarray,
     fit: np.ndarray,
     elapsed_s: float,
@@ -208,7 +288,11 @@ def make_result(
     return RunResult(
         dataset=dataset,
         variant=variant,
+        guinier_mode=guinier_mode,
         rebin=rebin,
+        raw_points=raw_points,
+        fit_points=len(fit),
+        guinier=guinier,
         elapsed_s=elapsed_s,
         ise=ise,
         rg_unfourier=rg_unfourier,
@@ -230,7 +314,159 @@ def peak_norm(p: np.ndarray) -> np.ndarray:
 
 
 def variant_label(result: RunResult) -> str:
-    return result.variant if result.rebin == 0 else f"{result.variant}, rebin={result.rebin}"
+    label = result.variant if result.rebin == 0 else f"{result.variant}, rebin={result.rebin}"
+    if result.guinier_mode != "off":
+        label = f"{label}, guinier={result.guinier_mode}"
+    return label
+
+
+def fmt_optional_float(value: float | None, width: int = 10, precision: int = 4) -> str:
+    if value is None or not np.isfinite(value):
+        return f"{'-':>{width}}"
+    return f"{value:>{width}.{precision}e}"
+
+
+def fmt_optional_int(value: int | None, width: int = 4) -> str:
+    if value is None:
+        return f"{'-':>{width}}"
+    return f"{value:>{width}d}"
+
+
+def dedupe_preserving_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def finite_delta(new: float, baseline: float) -> float:
+    if not np.isfinite(new) or not np.isfinite(baseline):
+        return float("nan")
+    return float(new - baseline)
+
+
+def materially_better(new: float, baseline: float, rel_tol: float = 0.02) -> bool:
+    if not np.isfinite(new) or not np.isfinite(baseline):
+        return False
+    scale = max(abs(baseline), 1e-12)
+    return new < baseline - rel_tol * scale
+
+
+def materially_worse(new: float, baseline: float, rel_tol: float = 0.02) -> bool:
+    if not np.isfinite(new) or not np.isfinite(baseline):
+        return False
+    scale = max(abs(baseline), 1e-12)
+    return new > baseline + rel_tol * scale
+
+
+def classify_guinier_impact(report: RunResult, applied: RunResult) -> str:
+    if applied.guinier.applied_qmin is None:
+        return "did nothing"
+
+    if (
+        applied.fit_points == report.fit_points
+        and abs(finite_delta(applied.ise, report.ise)) < 1e-12
+        and abs(finite_delta(applied.rg_rel_err, report.rg_rel_err)) < 1e-12
+    ):
+        return "did nothing"
+
+    better = (
+        materially_better(applied.ise, report.ise)
+        or materially_better(applied.rg_rel_err, report.rg_rel_err)
+        or materially_better(applied.chi_squared, report.chi_squared)
+    )
+    worse = (
+        materially_worse(applied.ise, report.ise)
+        or materially_worse(applied.rg_rel_err, report.rg_rel_err)
+        or materially_worse(applied.chi_squared, report.chi_squared)
+    )
+
+    if better and not worse:
+        return "helped"
+    if worse and not better:
+        return "hurt"
+    return "mixed"
+
+
+def print_guinier_comparison(results: list[RunResult]) -> None:
+    groups: dict[tuple[str, str, int], dict[str, RunResult]] = {}
+    for result in results:
+        if result.guinier_mode not in {"report", "apply"}:
+            continue
+        key = (result.dataset, result.variant, result.rebin)
+        groups.setdefault(key, {})[result.guinier_mode] = result
+
+    pairs = [
+        (modes["report"], modes["apply"])
+        for modes in groups.values()
+        if "report" in modes and "apply" in modes
+    ]
+    if not pairs:
+        return
+
+    header = (
+        f"{'Dataset':<10}  {'Variant':<12}  {'Rebin':>6}  {'qmin app':>10}  "
+        f"{'dPts':>6}  {'dISE':>10}  {'dRg/Rg':>10}  {'dchi2':>10}  {'Impact':<11}"
+    )
+    print()
+    print("Guinier apply vs report-only:")
+    print(header)
+    print("-" * len(header))
+
+    for report, applied in pairs:
+        rebin_str = str(applied.rebin) if applied.rebin > 0 else "-"
+        impact = classify_guinier_impact(report, applied)
+        print(
+            f"{applied.dataset:<10}  {applied.variant:<12}  {rebin_str:>6}  "
+            f"{fmt_optional_float(applied.guinier.applied_qmin)}  "
+            f"{applied.fit_points - report.fit_points:>6d}  "
+            f"{finite_delta(applied.ise, report.ise):>10.4g}  "
+            f"{finite_delta(applied.rg_rel_err, report.rg_rel_err):>10.4g}  "
+            f"{finite_delta(applied.chi_squared, report.chi_squared):>10.4g}  "
+            f"{impact:<11}"
+        )
+
+
+def print_report_only_equivalence(results: list[RunResult]) -> None:
+    groups: dict[tuple[str, str, int], dict[str, RunResult]] = {}
+    for result in results:
+        if result.guinier_mode not in {"off", "report"}:
+            continue
+        key = (result.dataset, result.variant, result.rebin)
+        groups.setdefault(key, {})[result.guinier_mode] = result
+
+    pairs = [
+        (modes["off"], modes["report"])
+        for modes in groups.values()
+        if "off" in modes and "report" in modes
+    ]
+    if not pairs:
+        return
+
+    header = (
+        f"{'Dataset':<10}  {'Variant':<12}  {'Rebin':>6}  {'max |dP|':>12}  {'Status':<6}"
+    )
+    print()
+    print("Guinier report-only equivalence:")
+    print(header)
+    print("-" * len(header))
+
+    for off, report in pairs:
+        rebin_str = str(report.rebin) if report.rebin > 0 else "-"
+        if off.pr.shape != report.pr.shape:
+            max_delta = float("nan")
+            status = "FAIL"
+        else:
+            max_delta = float(np.max(np.abs(off.pr - report.pr)))
+            status = "PASS" if max_delta <= 1e-12 else "FAIL"
+        print(
+            f"{report.dataset:<10}  {report.variant:<12}  {rebin_str:>6}  "
+            f"{max_delta:>12.4e}  {status:<6}"
+        )
 
 
 def plot_results(results: list[RunResult], refs: dict[str, dict], out_path: Path) -> None:
@@ -280,7 +516,7 @@ def plot_results(results: list[RunResult], refs: dict[str, dict], out_path: Path
         ax.legend(fontsize=8)
 
         ax = axes[2, col]
-        labels = [r.variant if r.rebin == 0 else f"rebin={r.rebin}" for r in matching]
+        labels = [variant_label(r) for r in matching]
         x = np.arange(len(matching))
         floor = 1e-12
         ax.bar(x - 0.2, [max(abs(r.left_slope), floor) for r in matching], width=0.2, label="abs left slope")
@@ -312,6 +548,17 @@ def main() -> None:
     )
     parser.add_argument("--method", choices=["gcv", "lcurve", "bayes"], default="gcv")
     parser.add_argument("--n-basis", type=int, default=20)
+    parser.add_argument(
+        "--guinier-mode",
+        dest="guinier_modes",
+        choices=["off", "report", "apply"],
+        action="append",
+        help=(
+            "Guinier validation mode. Use 'report' for --guinier-report and "
+            "'apply' for --guinier-report --auto-qmin guinier. Can be supplied "
+            "more than once to compare modes in one run. Default: off"
+        ),
+    )
     parser.add_argument("--rebin-large", type=int, default=200)
     parser.add_argument(
         "--rebin-threshold",
@@ -335,6 +582,7 @@ def main() -> None:
     args.outdir = args.outdir.expanduser().resolve()
     args.plot = args.plot.expanduser().resolve()
     args.config_dir = args.config_dir.expanduser().resolve()
+    guinier_modes = dedupe_preserving_order(args.guinier_modes or ["off"])
 
     if not args.unfourier.exists():
         raise SystemExit(f"binary not found: {args.unfourier}\nRun: cargo build --release")
@@ -362,9 +610,10 @@ def main() -> None:
     results: list[RunResult] = []
 
     header = (
-        f"{'Dataset':<10}  {'Variant':<12}  {'Rebin':>6}  {'ISE':>10}  "
-        f"{'dRg/Rg':>9}  {'Rg':>8}  {'chi2':>9}  {'P(0)':>10}  {'P(Dmax)':>10}  "
-        f"{'left dP':>10}  {'right dP':>10}  {'Time':>7}"
+        f"{'Dataset':<10}  {'Variant':<12}  {'Guinier':<7}  {'Rebin':>6}  "
+        f"{'Raw':>5}  {'Fit':>5}  {'skip':>4}  {'qmin rec':>10}  {'qmin app':>10}  "
+        f"{'ISE':>10}  {'dRg/Rg':>9}  {'Rg':>8}  {'chi2':>9}  {'P(0)':>10}  "
+        f"{'P(Dmax)':>10}  {'left dP':>10}  {'right dP':>10}  {'Time':>7}"
     )
     print(header)
     print("-" * len(header))
@@ -387,44 +636,69 @@ def main() -> None:
             variants.append(("spline-rebin", args.rebin_large))
 
         for variant, rebin in variants:
-            pr, fit, elapsed = run_unfourier(
-                args.unfourier,
-                dat_file,
-                d_max,
-                args.outdir,
-                name,
-                variant,
-                args.method,
-                args.n_basis,
-                rebin,
-                args.config_dir,
-            )
-            result = make_result(name, variant, rebin, pr, fit, elapsed, r_ref, pr_ref, rg_ref)
-            results.append(result)
+            for guinier_mode in guinier_modes:
+                pr, fit, elapsed, guinier = run_unfourier(
+                    args.unfourier,
+                    dat_file,
+                    d_max,
+                    args.outdir,
+                    name,
+                    variant,
+                    args.method,
+                    args.n_basis,
+                    rebin,
+                    guinier_mode,
+                    args.config_dir,
+                )
+                result = make_result(
+                    name,
+                    variant,
+                    guinier_mode,
+                    rebin,
+                    n_points,
+                    guinier,
+                    pr,
+                    fit,
+                    elapsed,
+                    r_ref,
+                    pr_ref,
+                    rg_ref,
+                )
+                results.append(result)
 
-            ise_ok = result.ise < args.ise_threshold
-            rg_ok = result.rg_rel_err < args.rg_rel_threshold
-            rebin_str = str(rebin) if rebin > 0 else "-"
-            print(
-                f"{name:<10}  {variant:<12}  {rebin_str:>6}  "
-                f"{result.ise:>7.4f} {'Y' if ise_ok else 'N':>2}  "
-                f"{result.rg_rel_err:>6.4f} {'Y' if rg_ok else 'N':>2}  "
-                f"{result.rg_unfourier:>8.3f}  {result.chi_squared:>9.3f}  {result.p0:>10.2e}  "
-                f"{result.p_end:>10.2e}  {result.left_slope:>10.2e}  "
-                f"{result.right_slope:>10.2e}  {result.elapsed_s:>7.2f}"
-            )
+                ise_ok = result.ise < args.ise_threshold
+                rg_ok = result.rg_rel_err < args.rg_rel_threshold
+                rebin_str = str(rebin) if rebin > 0 else "-"
+                qmin_applied = result.guinier.applied_qmin
+                print(
+                    f"{name:<10}  {variant:<12}  {guinier_mode:<7}  {rebin_str:>6}  "
+                    f"{result.raw_points:>5}  {result.fit_points:>5}  "
+                    f"{fmt_optional_int(result.guinier.recommended_skip)}  "
+                    f"{fmt_optional_float(result.guinier.recommended_qmin)}  "
+                    f"{fmt_optional_float(qmin_applied)}  "
+                    f"{result.ise:>7.4f} {'Y' if ise_ok else 'N':>2}  "
+                    f"{result.rg_rel_err:>6.4f} {'Y' if rg_ok else 'N':>2}  "
+                    f"{result.rg_unfourier:>8.3f}  {result.chi_squared:>9.3f}  "
+                    f"{result.p0:>10.2e}  {result.p_end:>10.2e}  "
+                    f"{result.left_slope:>10.2e}  {result.right_slope:>10.2e}  "
+                    f"{result.elapsed_s:>7.2f}"
+                )
 
     if refs and results:
         plot_results(results, refs, args.plot)
         print(f"\nValidation plot saved to: {args.plot}")
 
+    print_report_only_equivalence(results)
+    print_guinier_comparison(results)
+
     primary = [r for r in results if r.variant == "spline" and r.rebin == 0]
+    expected_primary = len(datasets) * len(guinier_modes)
     ise_pass = sum(r.ise < args.ise_threshold for r in primary)
     rg_all_pass = all(r.rg_rel_err < args.rg_rel_threshold for r in primary)
     required_ise = len(primary) if args.min_ise_passes is None else args.min_ise_passes
     required_ise = max(0, min(required_ise, len(primary)))
     overall_ok = (
-        len(primary) == len(datasets)
+        len(primary) == expected_primary
         and ise_pass >= required_ise
         and rg_all_pass
     )
@@ -432,10 +706,10 @@ def main() -> None:
     print()
     print(
         f"Pass criteria: primary spline ISE < {args.ise_threshold} for "
-        f">={required_ise}/{len(primary)} datasets; "
+        f">={required_ise}/{len(primary)} runs; "
         f"primary dRg/Rg < {args.rg_rel_threshold} for all"
     )
-    print(f"  ISE: {ise_pass}/{len(primary)} primary datasets pass")
+    print(f"  ISE: {ise_pass}/{len(primary)} primary runs pass")
     print(f"  Rg:  {'PASS' if rg_all_pass else 'FAIL'}")
     print(f"  Overall: {'PASS' if overall_ok else 'FAIL'}")
 

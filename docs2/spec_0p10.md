@@ -12,8 +12,8 @@ the suggested low-q cutoff as the effective `qmin`.
 
 ## Implementation Status
 
-Epic 1, Epic 2, and Epic 3 are implemented. The remaining 0.10 work starts at
-Epic 4: validation script support, broader integration checks, and user-facing
+Epic 1, Epic 2, Epic 3, and Epic 4 are implemented. The remaining 0.10 work
+starts at Epic 5: test guardrails, broader integration checks, and user-facing
 documentation.
 
 ## Goals
@@ -332,10 +332,18 @@ Acceptance:
 1. Validation scripts can still parse text if JSON is deferred.
 2. No unstable file format is advertised as permanent.
 
-## Epic 4: Validation Script Support
+## Epic 4: Validation Script Support - Done
 
 Use the real-data validation workflow to exercise both report-only and applied
 auto-qmin.
+
+Current implementation: `Dev/validate_real_data.py` accepts repeatable
+`--guinier-mode off|report|apply` switches. Report/apply modes write captured
+Guinier report snippets to the validation output directory. When both `off` and
+`report` are requested, the script verifies that report-only mode leaves P(r)
+unchanged. When both `report` and `apply` are requested, it compares point
+counts, ISE, Rg agreement, chi-squared, and classifies the applied mode as
+helped, hurt, mixed, or did nothing.
 
 ### Issue 4.1: Add validation switches
 
@@ -447,7 +455,7 @@ Acceptance:
 3. Done: Epic 2.1, add CLI report-only mode.
 4. Done: Epic 2.3, wire opt-in mutation through existing `QRangeSelector`.
 5. Done: Epic 2.2, add TOML config.
-6. Epic 4: update validation scripts.
+6. Done: Epic 4, update validation scripts.
 7. Epic 6: update active docs.
 8. Run final checks with Guinier off, report-only, and applied modes.
 
