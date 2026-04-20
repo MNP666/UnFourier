@@ -422,7 +422,7 @@ fn run_guinier_preflight(
     Some(GuinierPreflightResult { report, action })
 }
 
-fn representative_guinier_fits(report: &GuinierScanReport) -> Vec<&GuinierWindowFit> {
+fn guinier_report_rows(report: &GuinierScanReport) -> Vec<&GuinierWindowFit> {
     let mut rows = Vec::new();
     let mut start = 0usize;
 
@@ -434,12 +434,33 @@ fn representative_guinier_fits(report: &GuinierScanReport) -> Vec<&GuinierWindow
         }
 
         let group = &report.candidate_fits[start..end];
-        if let Some(fit) = group
+        let best_valid = group
             .iter()
             .filter(|fit| fit.valid)
-            .max_by_key(|fit| fit.n_points)
-            .or_else(|| group.iter().max_by_key(|fit| fit.n_points))
-        {
+            .max_by_key(|fit| fit.n_points);
+        if let Some(fit) = best_valid {
+            rows.push(fit);
+        }
+
+        let representative_reject = if let Some(valid) = best_valid {
+            group
+                .iter()
+                .filter(|fit| !fit.valid && fit.n_points > valid.n_points)
+                .min_by_key(|fit| fit.n_points)
+                .or_else(|| {
+                    group
+                        .iter()
+                        .filter(|fit| !fit.valid)
+                        .max_by_key(|fit| fit.n_points)
+                })
+        } else {
+            group
+                .iter()
+                .filter(|fit| !fit.valid)
+                .max_by_key(|fit| fit.n_points)
+        };
+
+        if let Some(fit) = representative_reject {
             rows.push(fit);
         }
 
@@ -461,8 +482,8 @@ fn format_guinier_report(preflight: &GuinierPreflightResult) -> String {
     out.push_str("skip  qmin          n   qmax*Rg       Rg          I0       chi2   status\n");
 
     let rec_skip = preflight.report.recommendation.as_ref().map(|rec| rec.skip);
-    for fit in representative_guinier_fits(&preflight.report) {
-        let status = if rec_skip == Some(fit.skip) {
+    for fit in guinier_report_rows(&preflight.report) {
+        let status = if fit.valid && rec_skip == Some(fit.skip) {
             "stable".to_string()
         } else if fit.valid {
             "valid".to_string()
@@ -493,7 +514,7 @@ fn format_guinier_report(preflight: &GuinierPreflightResult) -> String {
             rec.q_min, rec.skip
         ));
     } else {
-        out.push_str("Guinier recommendation: none");
+        out.push_str("Guinier recommendation: no stable recommendation");
     }
 
     match preflight.action {
@@ -1289,6 +1310,79 @@ mod tests {
 
         assert!(report.contains("Guinier scan:"));
         assert!(report.contains("not applied: qmin already set"));
+    }
+
+    #[test]
+    fn guinier_report_includes_valid_and_rejected_windows() {
+        let rg = 20.0_f64;
+        let i0 = 50.0_f64;
+        let q: Vec<f64> = (0..12).map(|idx| 0.005 + 0.005 * idx as f64).collect();
+        let intensity: Vec<f64> = q
+            .iter()
+            .map(|&qv| i0 * (-(rg * rg * qv * qv) / 3.0).exp())
+            .collect();
+        let error: Vec<f64> = intensity.iter().map(|&iv| 0.02 * iv).collect();
+        let data = SaxsData::new(q, intensity, error).unwrap();
+        let mut args = args_for_basis();
+        args.guinier_report = true;
+        let config = GuinierScanConfig {
+            min_points: 3,
+            max_points: 8,
+            max_skip: 0,
+            max_qrg: 0.51,
+            stability_windows: 1,
+            ..Default::default()
+        };
+        let preflight = run_guinier_preflight(&data, &mut args, &config, false).unwrap();
+
+        let report = format_guinier_report(&preflight);
+
+        assert!(
+            report.contains("stable"),
+            "report should include the accepted recommendation row:\n{report}"
+        );
+        assert!(
+            report.contains("reject: qmax*Rg too high"),
+            "report should include a representative rejected window:\n{report}"
+        );
+    }
+
+    #[test]
+    fn guinier_report_says_no_stable_recommendation() {
+        let data = synthetic_guinier_data();
+        let mut args = args_for_basis();
+        args.guinier_report = true;
+        let config = GuinierScanConfig {
+            min_points: 8,
+            max_points: 12,
+            max_skip: 0,
+            stability_windows: 2,
+            ..Default::default()
+        };
+        let preflight = run_guinier_preflight(&data, &mut args, &config, false).unwrap();
+
+        let report = format_guinier_report(&preflight);
+
+        assert!(report.contains("Guinier recommendation: no stable recommendation"));
+    }
+
+    #[test]
+    fn guinier_report_names_applied_q_range_change() {
+        let data = synthetic_guinier_data();
+        let mut args = args_for_basis();
+        args.auto_qmin = AutoQmin::Guinier;
+        let config = GuinierScanConfig {
+            min_points: 8,
+            max_points: 12,
+            max_skip: 4,
+            stability_windows: 3,
+            ..Default::default()
+        };
+        let preflight = run_guinier_preflight(&data, &mut args, &config, false).unwrap();
+
+        let report = format_guinier_report(&preflight);
+
+        assert!(report.contains("applied: low-q edge"));
     }
 
     #[test]

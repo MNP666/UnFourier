@@ -10,6 +10,12 @@ numbers of initial points, then report where `Rg` and `I0` become stable. It
 should support both a reporting-only mode and an opt-in mutation mode that uses
 the suggested low-q cutoff as the effective `qmin`.
 
+## Implementation Status
+
+Epic 1, Epic 2, and Epic 3 are implemented. The remaining 0.10 work starts at
+Epic 4: validation script support, broader integration checks, and user-facing
+documentation.
+
 ## Goals
 
 1. Add a small, testable Guinier scan routine for low-q quality checks.
@@ -129,7 +135,7 @@ Reject candidate windows with non-positive intensities, non-finite values,
 positive fitted slope, too few points, `qmax * Rg > max_qrg`, or poor reduced
 chi-squared.
 
-## Epic 1: Guinier Scan Core
+## Epic 1: Guinier Scan Core - Done
 
 Implement the analysis as a small reusable routine with no side effects.
 
@@ -224,7 +230,7 @@ Acceptance:
 2. A corrupted first point recommends a later `qmin`.
 3. A chaotic low-q series reports no recommendation rather than guessing.
 
-## Epic 2: CLI and TOML Integration
+## Epic 2: CLI and TOML Integration - Done
 
 Expose the scanner without making it a default hidden preprocessing step.
 
@@ -276,7 +282,7 @@ Acceptance:
 3. Explicit `--rmax` is not changed by the recommendation.
 4. Automatic `rmax` follows the actual processed data after q filtering.
 
-## Epic 3: Reporting
+## Epic 3: Reporting - Done
 
 Make the scan inspectable enough that users can decide whether to trust it.
 
@@ -314,6 +320,12 @@ Tasks:
 1. Decide whether a JSON report is worth adding in 0.10.
 2. If yes, add `--guinier-report-json <path>`.
 3. If no, document it as future work.
+
+Current decision: defer JSON output for now. Epic 3 is complete with the text
+report as the supported 0.10 reporting surface; validation scripts may parse the
+human-readable report during the 0.10 iteration. Add
+`--guinier-report-json <path>` later if text parsing becomes fragile or if
+external callers need a supported machine-readable format.
 
 Acceptance:
 
@@ -430,11 +442,11 @@ Acceptance:
 
 ## Suggested Implementation Order
 
-1. Epic 1: implement scanner and tests without CLI integration.
-2. Epic 3.1: add text report formatting.
-3. Epic 2.1: add CLI report-only mode.
-4. Epic 2.3: wire opt-in mutation through existing `QRangeSelector`.
-5. Epic 2.2: add TOML config.
+1. Done: Epic 1, implement scanner and tests without CLI integration.
+2. Done: Epic 3.1, add text report formatting.
+3. Done: Epic 2.1, add CLI report-only mode.
+4. Done: Epic 2.3, wire opt-in mutation through existing `QRangeSelector`.
+5. Done: Epic 2.2, add TOML config.
 6. Epic 4: update validation scripts.
 7. Epic 6: update active docs.
 8. Run final checks with Guinier off, report-only, and applied modes.
