@@ -223,9 +223,20 @@ mod tests {
 
         let c = projected_gradient_nnls(&a, &b, &warm, 500, 1e-8);
 
-        assert!(c.iter().all(|&x| x >= 0.0), "all coefficients must be non-negative");
-        assert!((c[0] - 0.1).abs() < 1e-6, "c[0] should be ~0.1, got {}", c[0]);
-        assert!((c[1] - 2.0).abs() < 1e-6, "c[1] should be ~2.0, got {}", c[1]);
+        assert!(
+            c.iter().all(|&x| x >= 0.0),
+            "all coefficients must be non-negative"
+        );
+        assert!(
+            (c[0] - 0.1).abs() < 1e-6,
+            "c[0] should be ~0.1, got {}",
+            c[0]
+        );
+        assert!(
+            (c[1] - 2.0).abs() < 1e-6,
+            "c[1] should be ~2.0, got {}",
+            c[1]
+        );
         assert!(c[2].abs() < 1e-6, "c[2] should be ~0.0, got {}", c[2]);
     }
 

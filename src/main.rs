@@ -1,18 +1,18 @@
 mod config;
 
-use anyhow::{anyhow, Result};
-use clap::{parser::ValueSource, CommandFactory, FromArgMatches, Parser, ValueEnum};
+use anyhow::{Result, anyhow};
+use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum, parser::ValueSource};
 use std::path::PathBuf;
 
 use unfourier::{
     basis::{BasisSet, CubicBSpline, SplineBoundaryMode},
-    data::{parse_dat, SaxsData},
+    data::{SaxsData, parse_dat},
     kernel::build_weighted_system,
     lambda_select::{
-        estimate_lambda_range, evaluate_lambda_grid, log_lambda_grid, posterior_coeff_sigma,
         BayesianEvidence, GcvSelector, GridMatrices, LCurveSelector, LambdaSelector,
+        estimate_lambda_range, evaluate_lambda_grid, log_lambda_grid, posterior_coeff_sigma,
     },
-    output::{print_summary, write_fit_to_file, write_pr_to_file, write_pr_to_stdout, PrCurve},
+    output::{PrCurve, print_summary, write_fit_to_file, write_pr_to_file, write_pr_to_stdout},
     preprocess::{ClipNegative, LogRebin, OmitNonPositive, Preprocessor, QRangeSelector},
     regularise::{ProjectedSplineRegulariser, Regulariser},
     solver::{Solution, Solver, TikhonovSolver},

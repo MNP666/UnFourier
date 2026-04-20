@@ -67,7 +67,7 @@
 //! where primes denote first/second centred finite differences with respect to
 //! the log(λ) index. The candidate with maximum κ is chosen.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use nalgebra::{DMatrix, DVector};
 
 use crate::nonneg::projected_gradient_nnls;

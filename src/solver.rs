@@ -1,15 +1,17 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use nalgebra::{DMatrix, DVector};
 use thiserror::Error;
 
-use crate::nonneg::{projected_gradient_nnls, NonNegativityStrategy, ProjectedGradient};
+use crate::nonneg::{NonNegativityStrategy, ProjectedGradient, projected_gradient_nnls};
 use crate::regularise::{Regulariser, SecondDerivative};
 
 #[derive(Debug, Error)]
 pub enum SolverError {
     #[error("SVD decomposition failed to converge")]
     SvdFailed,
-    #[error("kernel matrix dimensions ({kernel_rows}×{kernel_cols}) are incompatible with data length ({data_len})")]
+    #[error(
+        "kernel matrix dimensions ({kernel_rows}×{kernel_cols}) are incompatible with data length ({data_len})"
+    )]
     DimensionMismatch {
         kernel_rows: usize,
         kernel_cols: usize,

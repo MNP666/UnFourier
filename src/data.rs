@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 use thiserror::Error;
 
@@ -8,8 +8,14 @@ pub enum DataError {
     InconsistentLengths,
     #[error("data contains no points")]
     Empty,
-    #[error("q values are not strictly increasing: first violation at source line {line_num} (q[i]={prev} >= q[i+1]={next})")]
-    NonMonotoneQ { line_num: usize, prev: f64, next: f64 },
+    #[error(
+        "q values are not strictly increasing: first violation at source line {line_num} (q[i]={prev} >= q[i+1]={next})"
+    )]
+    NonMonotoneQ {
+        line_num: usize,
+        prev: f64,
+        next: f64,
+    },
 }
 
 /// Raw SAXS data: scattering vector q, measured intensity I(q), and error σ(q).
@@ -31,7 +37,11 @@ impl SaxsData {
         if q.is_empty() {
             bail!(DataError::Empty);
         }
-        Ok(Self { q, intensity, error })
+        Ok(Self {
+            q,
+            intensity,
+            error,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -208,8 +218,12 @@ mod tests {
             msg.contains("line 6"),
             "expected 'line 6' in error, got: {msg}"
         );
-        assert!(msg.contains("NonMonotoneQ") || msg.contains("strictly increasing") || msg.contains("violation"),
-            "expected monotonicity error, got: {msg}");
+        assert!(
+            msg.contains("NonMonotoneQ")
+                || msg.contains("strictly increasing")
+                || msg.contains("violation"),
+            "expected monotonicity error, got: {msg}"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::data::SaxsData;
 
@@ -116,7 +116,9 @@ pub struct ClipNegative {
 
 impl Default for ClipNegative {
     fn default() -> Self {
-        Self { sigma_inflate_factor: 1000.0 }
+        Self {
+            sigma_inflate_factor: 1000.0,
+        }
     }
 }
 
@@ -188,8 +190,7 @@ impl Preprocessor for OmitNonPositive {
         let intensity = indices.iter().map(|&i| data.intensity[i]).collect();
         let error = indices.iter().map(|&i| data.error[i]).collect();
 
-        SaxsData::new(q, intensity, error)
-            .map_err(|e| anyhow::anyhow!("omit-non-positive: {e}"))
+        SaxsData::new(q, intensity, error).map_err(|e| anyhow::anyhow!("omit-non-positive: {e}"))
     }
 }
 
@@ -248,8 +249,7 @@ impl Preprocessor for QRangeSelector {
         let intensity = indices.iter().map(|&i| data.intensity[i]).collect();
         let error = indices.iter().map(|&i| data.error[i]).collect();
 
-        SaxsData::new(q, intensity, error)
-            .map_err(|e| anyhow::anyhow!("q-range-selector: {e}"))
+        SaxsData::new(q, intensity, error).map_err(|e| anyhow::anyhow!("q-range-selector: {e}"))
     }
 }
 
@@ -287,7 +287,9 @@ impl Preprocessor for LogRebin {
         let q_hi = data.q[data.len() - 1];
 
         if q_lo <= 0.0 {
-            bail!("log-rebin: q values must be positive for logarithmic binning (got q_min={q_lo})");
+            bail!(
+                "log-rebin: q values must be positive for logarithmic binning (got q_min={q_lo})"
+            );
         }
 
         // n_bins + 1 log-spaced edges covering [q_lo, q_hi].
@@ -334,8 +336,7 @@ impl Preprocessor for LogRebin {
             bail!("log-rebin: all bins are empty");
         }
 
-        SaxsData::new(q_out, i_out, e_out)
-            .map_err(|e| anyhow::anyhow!("log-rebin: {e}"))
+        SaxsData::new(q_out, i_out, e_out).map_err(|e| anyhow::anyhow!("log-rebin: {e}"))
     }
 }
 
@@ -391,12 +392,12 @@ mod tests {
     #[test]
     fn q_range_selector_manual_range_returns_expected_subset() {
         // 6 points at q = 0.01, 0.02, 0.03, 0.04, 0.05, 0.06
-        let data = make_data(
-            &[0.01, 0.02, 0.03, 0.04, 0.05, 0.06],
-            &[10.0; 6],
-            &[0.1; 6],
-        );
-        let sel = QRangeSelector { q_min: Some(0.02), q_max: Some(0.05), snr_threshold: None };
+        let data = make_data(&[0.01, 0.02, 0.03, 0.04, 0.05, 0.06], &[10.0; 6], &[0.1; 6]);
+        let sel = QRangeSelector {
+            q_min: Some(0.02),
+            q_max: Some(0.05),
+            snr_threshold: None,
+        };
         let out = sel.process(data).unwrap();
         assert_eq!(out.len(), 4);
         assert!((out.q[0] - 0.02).abs() < 1e-12);
@@ -412,7 +413,11 @@ mod tests {
             &[20.0, 15.0, 8.0, 1.0, 1.0],
             &[0.1, 0.1, 0.5, 5.0, 5.0],
         );
-        let sel = QRangeSelector { q_min: None, q_max: None, snr_threshold: Some(2.0) };
+        let sel = QRangeSelector {
+            q_min: None,
+            q_max: None,
+            snr_threshold: Some(2.0),
+        };
         let out = sel.process(data).unwrap();
         // Points at index 3 and 4 (SNR = 0.2) should be trimmed.
         assert_eq!(out.len(), 3);
@@ -424,7 +429,9 @@ mod tests {
         // 100 log-spaced points from q=0.01 to q=1.0 with constant I=10, σ=0.5.
         let n = 100usize;
         let q: Vec<f64> = (0..n)
-            .map(|i| (0.01_f64.ln() + (1.0_f64.ln() - 0.01_f64.ln()) * i as f64 / (n - 1) as f64).exp())
+            .map(|i| {
+                (0.01_f64.ln() + (1.0_f64.ln() - 0.01_f64.ln()) * i as f64 / (n - 1) as f64).exp()
+            })
             .collect();
         let intensity = vec![10.0_f64; n];
         let error = vec![0.5_f64; n];
@@ -438,21 +445,31 @@ mod tests {
 
         // Mean intensity in each bin must be 10.0 (all inputs are 10.0).
         for i in 0..out.len() {
-            assert!((out.intensity[i] - 10.0).abs() < 1e-10,
-                "bin {i}: expected I=10.0, got {}", out.intensity[i]);
+            assert!(
+                (out.intensity[i] - 10.0).abs() < 1e-10,
+                "bin {i}: expected I=10.0, got {}",
+                out.intensity[i]
+            );
         }
 
         // q values must be strictly increasing (monotone output).
         for i in 0..out.len() - 1 {
-            assert!(out.q[i] < out.q[i + 1],
-                "q not monotone at bin {i}: {} >= {}", out.q[i], out.q[i + 1]);
+            assert!(
+                out.q[i] < out.q[i + 1],
+                "q not monotone at bin {i}: {} >= {}",
+                out.q[i],
+                out.q[i + 1]
+            );
         }
 
         // σ_new = sqrt(n_in * 0.25) / n_in = 0.5 / sqrt(n_in).
         // For each bin with n_in points: σ_new = 0.5 / sqrt(n_in) < 0.5.
         for i in 0..out.len() {
-            assert!(out.error[i] <= 0.5 + 1e-10,
-                "bin {i}: error should not exceed single-point σ=0.5, got {}", out.error[i]);
+            assert!(
+                out.error[i] <= 0.5 + 1e-10,
+                "bin {i}: error should not exceed single-point σ=0.5, got {}",
+                out.error[i]
+            );
             assert!(out.error[i] > 0.0, "bin {i}: error should be positive");
         }
     }

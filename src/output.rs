@@ -1,5 +1,5 @@
 use crate::solver::Solution;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::io::{self, Write};
 use std::path::Path;
 
