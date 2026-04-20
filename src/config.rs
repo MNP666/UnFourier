@@ -16,6 +16,21 @@ pub struct PreprocessingConfig {
     pub qmin: Option<f64>,
     pub qmax: Option<f64>,
     pub negative_handling: Option<String>,
+    pub auto_qmin: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct GuinierConfig {
+    pub report: Option<bool>,
+    pub min_points: Option<usize>,
+    pub max_points: Option<usize>,
+    pub max_skip: Option<usize>,
+    pub max_qrg: Option<f64>,
+    pub stability_windows: Option<usize>,
+    pub rg_tolerance: Option<f64>,
+    pub i0_tolerance: Option<f64>,
+    pub max_chi2: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -43,6 +58,8 @@ pub struct UnfourierConfig {
     pub regularisation: RegularisationConfig,
     #[serde(default)]
     pub preprocessing: PreprocessingConfig,
+    #[serde(default)]
+    pub guinier: GuinierConfig,
     #[serde(default)]
     pub basis: BasisConfig,
     #[serde(default)]
@@ -99,6 +116,18 @@ lambda_max = 1e2
 qmin = 0.01
 qmax = 0.50
 negative_handling = "omit"
+auto_qmin = "guinier"
+
+[guinier]
+report = true
+min_points = 8
+max_points = 25
+max_skip = 8
+max_qrg = 1.3
+stability_windows = 3
+rg_tolerance = 0.02
+i0_tolerance = 0.03
+max_chi2 = 3.0
 
 [basis]
 n_basis = 30
@@ -115,6 +144,16 @@ d2_smoothness = 1.5
         assert_eq!(cfg.regularisation.method.as_deref(), Some("lcurve"));
         assert_eq!(cfg.preprocessing.qmin, Some(0.01));
         assert_eq!(cfg.preprocessing.negative_handling.as_deref(), Some("omit"));
+        assert_eq!(cfg.preprocessing.auto_qmin.as_deref(), Some("guinier"));
+        assert_eq!(cfg.guinier.report, Some(true));
+        assert_eq!(cfg.guinier.min_points, Some(8));
+        assert_eq!(cfg.guinier.max_points, Some(25));
+        assert_eq!(cfg.guinier.max_skip, Some(8));
+        assert_eq!(cfg.guinier.max_qrg, Some(1.3));
+        assert_eq!(cfg.guinier.stability_windows, Some(3));
+        assert_eq!(cfg.guinier.rg_tolerance, Some(0.02));
+        assert_eq!(cfg.guinier.i0_tolerance, Some(0.03));
+        assert_eq!(cfg.guinier.max_chi2, Some(3.0));
         assert_eq!(cfg.basis.n_basis, Some(30));
         assert_eq!(cfg.basis.knot_spacing, Some(7.5));
         assert_eq!(cfg.basis.min_basis, Some(12));
@@ -132,6 +171,7 @@ d2_smoothness = 1.5
         let cfg: UnfourierConfig = toml::from_str("").unwrap();
         assert!(cfg.regularisation.lambda_min.is_none());
         assert!(cfg.preprocessing.qmax.is_none());
+        assert!(cfg.guinier.report.is_none());
     }
 
     #[test]
@@ -217,6 +257,19 @@ spline_boundary = "clamped-ish"
         let err = toml::from_str::<UnfourierConfig>(text).unwrap_err();
         assert!(
             err.to_string().contains("unknown variant"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_guinier_field_is_rejected() {
+        let text = r#"
+[guinier]
+magic = true
+"#;
+        let err = toml::from_str::<UnfourierConfig>(text).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
             "unexpected error: {err}"
         );
     }

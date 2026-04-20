@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use unfourier::{
     basis::{BasisSet, CubicBSpline, SplineBoundaryMode},
     data::{SaxsData, parse_dat},
+    guinier::{GuinierScanConfig, GuinierScanReport, GuinierWindowFit, scan_guinier},
     kernel::build_weighted_system,
     lambda_select::{
         BayesianEvidence, GcvSelector, GridMatrices, LCurveSelector, LambdaSelector,
@@ -39,6 +40,25 @@ fn parse_negative_handling_config(value: &str) -> Result<NegativeHandling> {
     NegativeHandling::from_str(value, true).map_err(|_| {
         anyhow!(
             "unfourier.toml: unknown preprocessing.negative_handling '{}'; expected one of: clip, omit, keep",
+            value
+        )
+    })
+}
+
+/// Whether low-q preprocessing should be mutated automatically.
+#[derive(Debug, Clone, ValueEnum, Default, PartialEq)]
+enum AutoQmin {
+    /// Do not apply an automatic low-q cutoff.
+    #[default]
+    Off,
+    /// Use the Guinier preflight recommendation as qmin when qmin is unset.
+    Guinier,
+}
+
+fn parse_auto_qmin_config(value: &str) -> Result<AutoQmin> {
+    AutoQmin::from_str(value, true).map_err(|_| {
+        anyhow!(
+            "unfourier.toml: unknown preprocessing.auto_qmin '{}'; expected one of: off, guinier",
             value
         )
     })
@@ -153,6 +173,15 @@ struct Args {
     /// 0 = disabled (default). Useful for large datasets (e.g. SASDYU3, 1696 pts).
     #[arg(long, default_value_t = 0)]
     rebin: usize,
+
+    /// Print a Guinier low-q preflight report without changing the fit.
+    #[arg(long)]
+    guinier_report: bool,
+
+    /// Automatically choose qmin. 'off' leaves qmin unchanged; 'guinier'
+    /// applies the Guinier recommendation only when qmin is not already set.
+    #[arg(long, value_enum, default_value_t = AutoQmin::Off)]
+    auto_qmin: AutoQmin,
 
     /// Write P(r) to this file. Defaults to stdout.
     #[arg(short, long)]
@@ -335,6 +364,188 @@ fn resolve_smoothness_weights(
 }
 
 // ---------------------------------------------------------------------------
+// Guinier preflight
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+enum GuinierPreflightAction {
+    ReportOnly,
+    Applied {
+        previous_qmin: f64,
+        applied_qmin: f64,
+    },
+    ExplicitQmin {
+        qmin: f64,
+    },
+    NoRecommendation,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct GuinierPreflightResult {
+    report: GuinierScanReport,
+    action: GuinierPreflightAction,
+}
+
+fn run_guinier_preflight(
+    data: &SaxsData,
+    args: &mut Args,
+    config: &GuinierScanConfig,
+    qmin_already_set: bool,
+) -> Option<GuinierPreflightResult> {
+    let auto_requested = matches!(args.auto_qmin, AutoQmin::Guinier);
+    if !args.guinier_report && !auto_requested {
+        return None;
+    }
+
+    let report = scan_guinier(data, config);
+    let action = match args.auto_qmin {
+        AutoQmin::Off => GuinierPreflightAction::ReportOnly,
+        AutoQmin::Guinier if qmin_already_set => GuinierPreflightAction::ExplicitQmin {
+            qmin: args
+                .qmin
+                .expect("qmin_already_set implies args.qmin is Some"),
+        },
+        AutoQmin::Guinier => {
+            if let Some(rec) = &report.recommendation {
+                let previous_qmin = data.q_min();
+                args.qmin = Some(rec.q_min);
+                GuinierPreflightAction::Applied {
+                    previous_qmin,
+                    applied_qmin: rec.q_min,
+                }
+            } else {
+                GuinierPreflightAction::NoRecommendation
+            }
+        }
+    };
+
+    Some(GuinierPreflightResult { report, action })
+}
+
+fn representative_guinier_fits(report: &GuinierScanReport) -> Vec<&GuinierWindowFit> {
+    let mut rows = Vec::new();
+    let mut start = 0usize;
+
+    while start < report.candidate_fits.len() {
+        let skip = report.candidate_fits[start].skip;
+        let mut end = start + 1;
+        while end < report.candidate_fits.len() && report.candidate_fits[end].skip == skip {
+            end += 1;
+        }
+
+        let group = &report.candidate_fits[start..end];
+        if let Some(fit) = group
+            .iter()
+            .filter(|fit| fit.valid)
+            .max_by_key(|fit| fit.n_points)
+            .or_else(|| group.iter().max_by_key(|fit| fit.n_points))
+        {
+            rows.push(fit);
+        }
+
+        start = end;
+    }
+
+    rows
+}
+
+fn format_optional(value: Option<f64>, width: usize, precision: usize) -> String {
+    match value {
+        Some(v) => format!("{v:>width$.precision$}"),
+        None => format!("{:>width$}", "--"),
+    }
+}
+
+fn format_guinier_report(preflight: &GuinierPreflightResult) -> String {
+    let mut out = String::from("Guinier scan:\n");
+    out.push_str("skip  qmin          n   qmax*Rg       Rg          I0       chi2   status\n");
+
+    let rec_skip = preflight.report.recommendation.as_ref().map(|rec| rec.skip);
+    for fit in representative_guinier_fits(&preflight.report) {
+        let status = if rec_skip == Some(fit.skip) {
+            "stable".to_string()
+        } else if fit.valid {
+            "valid".to_string()
+        } else {
+            match fit.reject_reason {
+                Some(reason) => format!("reject: {reason}"),
+                None => "reject".to_string(),
+            }
+        };
+
+        out.push_str(&format!(
+            "{:<4}  {}  {:>3}  {}  {}  {}  {}   {}\n",
+            fit.skip,
+            format_optional(fit.q_min, 10, 4),
+            fit.n_points,
+            format_optional(fit.qrg_max, 8, 3),
+            format_optional(fit.rg, 8, 3),
+            format_optional(fit.i0, 10, 3),
+            format_optional(fit.chi2_red, 8, 3),
+            status
+        ));
+    }
+
+    out.push('\n');
+    if let Some(rec) = &preflight.report.recommendation {
+        out.push_str(&format!(
+            "Guinier recommendation: qmin = {:.4e} (skip {})",
+            rec.q_min, rec.skip
+        ));
+    } else {
+        out.push_str("Guinier recommendation: none");
+    }
+
+    match preflight.action {
+        GuinierPreflightAction::ReportOnly => out.push_str(", report-only"),
+        GuinierPreflightAction::Applied {
+            previous_qmin,
+            applied_qmin,
+        } => out.push_str(&format!(
+            ", applied: low-q edge {:.4e} -> {:.4e}",
+            previous_qmin, applied_qmin
+        )),
+        GuinierPreflightAction::ExplicitQmin { qmin } => {
+            out.push_str(&format!(", not applied: qmin already set to {:.4e}", qmin))
+        }
+        GuinierPreflightAction::NoRecommendation => {
+            out.push_str(", auto-qmin requested; qmin left unset")
+        }
+    }
+
+    out
+}
+
+fn format_guinier_note(preflight: &GuinierPreflightResult) -> Option<String> {
+    match preflight.action {
+        GuinierPreflightAction::ReportOnly => None,
+        GuinierPreflightAction::Applied {
+            previous_qmin,
+            applied_qmin,
+        } => {
+            let skip = preflight
+                .report
+                .recommendation
+                .as_ref()
+                .map(|rec| rec.skip)
+                .unwrap_or(0);
+            Some(format!(
+                "guinier: auto-qmin applied qmin = {:.4e} (skip {}); low-q edge {:.4e} -> {:.4e}",
+                applied_qmin, skip, previous_qmin, applied_qmin
+            ))
+        }
+        GuinierPreflightAction::ExplicitQmin { qmin } => Some(format!(
+            "guinier: auto-qmin requested but qmin = {:.4e} is already set; recommendation not applied",
+            qmin
+        )),
+        GuinierPreflightAction::NoRecommendation => Some(
+            "guinier: auto-qmin requested but no stable recommendation; qmin left unset"
+                .to_string(),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Solve helper
 // ---------------------------------------------------------------------------
 
@@ -448,6 +659,9 @@ fn main() -> Result<()> {
     let matches = Args::command().get_matches();
     let cli_negative_handling =
         matches.value_source("negative_handling") == Some(ValueSource::CommandLine);
+    let cli_auto_qmin = matches.value_source("auto_qmin") == Some(ValueSource::CommandLine);
+    let cli_guinier_report =
+        matches.value_source("guinier_report") == Some(ValueSource::CommandLine);
     let mut args = Args::from_arg_matches(&matches)?;
     let cli_n_basis = args.n_basis.is_some();
     let cli_knot_spacing = args.knot_spacing.is_some();
@@ -459,6 +673,7 @@ fn main() -> Result<()> {
     let mut d1_smoothness: Option<f64> = None;
     let mut d2_smoothness: Option<f64> = None;
     let mut spline_boundary = SplineBoundaryMode::default();
+    let mut guinier_config = GuinierScanConfig::default();
 
     if let Some(cfg) = config::UnfourierConfig::load()? {
         if args.verbose {
@@ -523,6 +738,61 @@ fn main() -> Result<()> {
                 }
             }
         }
+        if !cli_auto_qmin {
+            if let Some(ref v) = cfg.preprocessing.auto_qmin {
+                args.auto_qmin = parse_auto_qmin_config(v)?;
+                if args.verbose {
+                    eprintln!("  [config]   auto_qmin = {}", v);
+                }
+            }
+        }
+
+        // [guinier]
+        if !cli_guinier_report {
+            if let Some(v) = cfg.guinier.report {
+                args.guinier_report = v;
+                if args.verbose {
+                    eprintln!("  [config]   guinier.report = {}", v);
+                }
+            }
+        }
+        if let Some(v) = cfg.guinier.min_points {
+            guinier_config.min_points = v;
+        }
+        if let Some(v) = cfg.guinier.max_points {
+            guinier_config.max_points = v;
+        }
+        if let Some(v) = cfg.guinier.max_skip {
+            guinier_config.max_skip = v;
+        }
+        if let Some(v) = cfg.guinier.max_qrg {
+            guinier_config.max_qrg = v;
+        }
+        if let Some(v) = cfg.guinier.stability_windows {
+            guinier_config.stability_windows = v;
+        }
+        if let Some(v) = cfg.guinier.rg_tolerance {
+            guinier_config.rg_tolerance = v;
+        }
+        if let Some(v) = cfg.guinier.i0_tolerance {
+            guinier_config.i0_tolerance = v;
+        }
+        if let Some(v) = cfg.guinier.max_chi2 {
+            guinier_config.max_chi2 = v;
+        }
+        if args.verbose
+            && (cfg.guinier.min_points.is_some()
+                || cfg.guinier.max_points.is_some()
+                || cfg.guinier.max_skip.is_some()
+                || cfg.guinier.max_qrg.is_some()
+                || cfg.guinier.stability_windows.is_some()
+                || cfg.guinier.rg_tolerance.is_some()
+                || cfg.guinier.i0_tolerance.is_some()
+                || cfg.guinier.max_chi2.is_some())
+        {
+            eprintln!("  [config]   guinier scan parameters loaded");
+        }
+
         // [basis]
         if !cli_n_basis && !cli_knot_spacing && args.n_basis.is_none() {
             if let Some(n) = cfg.basis.n_basis {
@@ -579,6 +849,7 @@ fn main() -> Result<()> {
     }
 
     let smoothness = resolve_smoothness_weights(d1_smoothness, d2_smoothness)?;
+    let qmin_already_set = args.qmin.is_some();
 
     // Resolve the effective method: explicit --method, or infer from --lambda.
     let method = match (&args.method, args.lambda) {
@@ -634,7 +905,20 @@ fn main() -> Result<()> {
         }
     }
 
-    // Step B: q-range / SNR filtering.
+    // Step B: optional Guinier low-q preflight.
+    if let Some(preflight) =
+        run_guinier_preflight(&data, &mut args, &guinier_config, qmin_already_set)
+    {
+        let print_report =
+            args.guinier_report || (args.verbose && matches!(args.auto_qmin, AutoQmin::Guinier));
+        if print_report {
+            eprintln!("{}", format_guinier_report(&preflight));
+        } else if let Some(note) = format_guinier_note(&preflight) {
+            eprintln!("{note}");
+        }
+    }
+
+    // Step C: q-range / SNR filtering.
     let use_qrange = args.qmin.is_some() || args.qmax.is_some() || args.snr_cutoff > 0.0;
     if use_qrange {
         let step = QRangeSelector {
@@ -660,7 +944,7 @@ fn main() -> Result<()> {
         }
     }
 
-    // Step C: log-rebinning.
+    // Step D: log-rebinning.
     if args.rebin > 0 {
         let step = LogRebin { n_bins: args.rebin };
         let before = data.len();
@@ -824,6 +1108,8 @@ mod tests {
             qmax: None,
             snr_cutoff: 0.0,
             rebin: 0,
+            guinier_report: false,
+            auto_qmin: AutoQmin::Off,
             output: None,
             fit_output: None,
             verbose: false,
@@ -871,6 +1157,138 @@ mod tests {
                 .contains("unknown preprocessing.negative_handling"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn auto_qmin_config_parses_known_values() {
+        assert_eq!(parse_auto_qmin_config("off").unwrap(), AutoQmin::Off);
+        assert_eq!(
+            parse_auto_qmin_config("guinier").unwrap(),
+            AutoQmin::Guinier
+        );
+        assert_eq!(
+            parse_auto_qmin_config("GUINIER").unwrap(),
+            AutoQmin::Guinier
+        );
+    }
+
+    #[test]
+    fn auto_qmin_config_rejects_unknown_values() {
+        let err = parse_auto_qmin_config("magic").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown preprocessing.auto_qmin"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_cli_auto_qmin_fails_through_clap() {
+        let result = Args::try_parse_from(["unfourier", "data.dat", "--auto-qmin", "magic"]);
+        assert!(result.is_err());
+    }
+
+    fn synthetic_guinier_data() -> SaxsData {
+        let rg = 35.0_f64;
+        let i0 = 100.0_f64;
+        let q: Vec<f64> = (0..32).map(|idx| 0.002 + 0.001 * idx as f64).collect();
+        let intensity: Vec<f64> = q
+            .iter()
+            .map(|&qv| i0 * (-(rg * rg * qv * qv) / 3.0).exp())
+            .collect();
+        let error: Vec<f64> = intensity.iter().map(|&iv| 0.02 * iv).collect();
+        SaxsData::new(q, intensity, error).unwrap()
+    }
+
+    #[test]
+    fn guinier_report_only_leaves_qmin_unset() {
+        let data = synthetic_guinier_data();
+        let mut args = args_for_basis();
+        args.guinier_report = true;
+        let config = GuinierScanConfig {
+            min_points: 8,
+            max_points: 12,
+            max_skip: 4,
+            stability_windows: 3,
+            ..Default::default()
+        };
+
+        let preflight = run_guinier_preflight(&data, &mut args, &config, false)
+            .expect("report-only preflight should run");
+
+        assert_eq!(args.qmin, None);
+        assert!(matches!(
+            preflight.action,
+            GuinierPreflightAction::ReportOnly
+        ));
+    }
+
+    #[test]
+    fn guinier_auto_qmin_applies_recommendation_when_qmin_unset() {
+        let data = synthetic_guinier_data();
+        let mut args = args_for_basis();
+        args.auto_qmin = AutoQmin::Guinier;
+        let config = GuinierScanConfig {
+            min_points: 8,
+            max_points: 12,
+            max_skip: 4,
+            stability_windows: 3,
+            ..Default::default()
+        };
+
+        let preflight = run_guinier_preflight(&data, &mut args, &config, false)
+            .expect("auto-qmin preflight should run");
+
+        assert_eq!(args.qmin, Some(data.q[0]));
+        assert!(matches!(
+            preflight.action,
+            GuinierPreflightAction::Applied { .. }
+        ));
+    }
+
+    #[test]
+    fn guinier_auto_qmin_respects_existing_qmin() {
+        let data = synthetic_guinier_data();
+        let mut args = args_for_basis();
+        args.auto_qmin = AutoQmin::Guinier;
+        args.qmin = Some(0.006);
+        let config = GuinierScanConfig {
+            min_points: 8,
+            max_points: 12,
+            max_skip: 4,
+            stability_windows: 3,
+            ..Default::default()
+        };
+
+        let preflight = run_guinier_preflight(&data, &mut args, &config, true)
+            .expect("auto-qmin preflight should run");
+
+        assert_eq!(args.qmin, Some(0.006));
+        assert!(matches!(
+            preflight.action,
+            GuinierPreflightAction::ExplicitQmin { qmin }
+                if (qmin - 0.006).abs() < 1e-12
+        ));
+    }
+
+    #[test]
+    fn guinier_report_mentions_explicit_qmin_precedence() {
+        let data = synthetic_guinier_data();
+        let mut args = args_for_basis();
+        args.auto_qmin = AutoQmin::Guinier;
+        args.qmin = Some(0.006);
+        let config = GuinierScanConfig {
+            min_points: 8,
+            max_points: 12,
+            max_skip: 4,
+            stability_windows: 3,
+            ..Default::default()
+        };
+        let preflight = run_guinier_preflight(&data, &mut args, &config, true).unwrap();
+
+        let report = format_guinier_report(&preflight);
+
+        assert!(report.contains("Guinier scan:"));
+        assert!(report.contains("not applied: qmin already set"));
     }
 
     #[test]
