@@ -12,9 +12,8 @@ the suggested low-q cutoff as the effective `qmin`.
 
 ## Implementation Status
 
-Epic 1, Epic 2, Epic 3, and Epic 4 are implemented. The remaining 0.10 work
-starts at Epic 5: test guardrails, broader integration checks, and user-facing
-documentation.
+Epic 1, Epic 2, Epic 3, Epic 4, and Epic 5 are implemented. The remaining 0.10
+work starts at Epic 6: user-facing and developer documentation.
 
 ## Goals
 
@@ -384,6 +383,13 @@ Acceptance:
 
 Keep the experimental feature from silently doing surprising things.
 
+Current implementation: scanner unit tests cover synthetic recovery, corrupted
+low-q points, rejected windows, and no-recommendation behavior. Binary unit
+tests cover report formatting and qmin precedence. CLI integration tests in
+`tests/guinier_cli.rs` cover report-only equivalence, applied auto-qmin,
+explicit qmin precedence, and CLI override of TOML `auto_qmin`. Real-data
+validation results are recorded in `docs2/epic5_validation.md`.
+
 ### Issue 5.1: Unit tests
 
 Tasks:
@@ -456,8 +462,8 @@ Acceptance:
 4. Done: Epic 2.3, wire opt-in mutation through existing `QRangeSelector`.
 5. Done: Epic 2.2, add TOML config.
 6. Done: Epic 4, update validation scripts.
-7. Epic 6: update active docs.
-8. Run final checks with Guinier off, report-only, and applied modes.
+7. Done: Epic 5, add guardrail tests and run off/report/apply validation.
+8. Epic 6: update active docs.
 
 ## Open Questions
 
