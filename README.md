@@ -1,6 +1,6 @@
 # unFourier
 
-**Work in progress.** The current project version is **0.9**. The codebase is
+**Work in progress.** The current project version is **0.10**. The codebase is
 usable for experimentation, but it is not yet a validated analysis tool.
 Version **1.0** will be the first version where at least one regularisation /
 selection method, such as GCV, L-curve, Bayesian evidence, or a manual workflow,
@@ -26,11 +26,12 @@ A Rust implementation of Indirect Fourier Transformation (IFT) for Small Angle X
 
 ## Status
 
-Current version: **0.9**.
+Current version: **0.10**.
 
-The milestone features are implemented as code paths, but M3-M8 should still be
-treated as work in progress. The next goal is not to add more surface area, but
-to validate and harden at least one method into a reliable 1.0 workflow.
+The milestone features are implemented as code paths, but M3-M8 and the 0.10
+Guinier preflight should still be treated as work in progress. The next goal is
+not to add more surface area, but to validate and harden at least one method into
+a reliable 1.0 workflow.
 
 | Milestone | Description | Current state |
 |-----------|-------------|---------------|
@@ -42,6 +43,11 @@ to validate and harden at least one method into a reliable 1.0 workflow.
 | M6 | Full preprocessing pipeline (rebinning, q-range, SNR trimming) | Implemented, policy still being validated |
 | M7 | Real-data validation and GCV robustness (GCV-fallback, NNLS) | Implemented as exploratory validation |
 | M8 | Perceptual constraints (boundary enforcement, combined regulariser) | Implemented, tuning and validation in progress |
+
+The 0.10 iteration adds an experimental Guinier low-q preflight. It can print a
+report without changing the fit, or it can opt in to applying a suggested
+low-q cutoff via `--auto-qmin guinier`. Applied mode is intentionally not the
+default and should be inspected rather than trusted blindly.
 
 See [MILESTONES.md](MILESTONES.md) for the full plan and rationale.
 
@@ -85,6 +91,8 @@ Options:
   --qmax <F>                 Discard points with q above this value (Å⁻¹)
   --snr-cutoff <F>           Trim high-q tail where I/σ < threshold  [default: 0]
   --rebin <N>                Rebin into N log-spaced q bins  [default: 0]
+  --guinier-report           Print a Guinier low-q preflight report
+  --auto-qmin <MODE>         off | guinier  [default: off]
   -o, --output <FILE>        Write P(r) here  [default: stdout]
   --fit-output <FILE>        Write back-calculated I(q) here
   -v, --verbose              Print diagnostics to stderr
@@ -116,9 +124,43 @@ unfourier data.dat --rmax 150 --lambda 0.01 --output pr.dat
 # Preprocessing: trim q-range, SNR cutoff, and rebin
 unfourier data.dat --rmax 55 --qmin 0.01 --qmax 0.30 --snr-cutoff 3 --rebin 200
 
+# Guinier low-q preflight report only. Does not change the fit.
+unfourier data.dat --guinier-report --rmax 150
+
+# Apply the Guinier recommendation as qmin only if --qmin is not supplied.
+unfourier data.dat --auto-qmin guinier --guinier-report --rmax 150
+
+# Explicit qmin wins over auto-qmin; the report can still be printed.
+unfourier data.dat --qmin 0.006 --auto-qmin guinier --guinier-report --rmax 150
+
 # Wider λ search range
 unfourier data.dat --rmax 150 --lambda-min 1e-8 --lambda-max 1e5
 ```
+
+### Guinier preflight
+
+The Guinier preflight scans the low-q prefix of the input data by fitting:
+
+```text
+ln I(q) = ln I0 - Rg² q² / 3
+```
+
+It repeatedly skips increasing numbers of initial low-q points, keeps candidate
+windows that satisfy the configured Guinier range and chi-squared checks, and
+looks for a stable plateau in `Rg` and `I0`. The report includes accepted and
+rejected windows plus a suggested `qmin` when a stable recommendation exists.
+
+Two modes are available:
+
+| Mode | Command | Effect |
+|------|---------|--------|
+| Report only | `--guinier-report` | Prints the scan and leaves the fit unchanged. |
+| Applied | `--auto-qmin guinier` | Uses the recommendation as the effective `qmin` only when `--qmin` is unset. |
+
+The scan runs after negative-intensity handling and before q-range/SNR
+filtering. If `--qmin` is supplied explicitly, it always wins over the automatic
+recommendation. This feature is experimental in 0.10; use it as a diagnostic
+assistant, not as a substitute for manual Guinier inspection.
 
 ### TOML configuration
 
@@ -134,6 +176,18 @@ lambda_max = 1e3        # upper bound of λ search grid
 qmin = 0.01             # Å⁻¹ — discard points below this q
 qmax = 0.35             # Å⁻¹ — discard points above this q
 negative_handling = "clip"  # clip | omit | keep for non-positive I(q)
+auto_qmin = "off"       # off | guinier
+
+[guinier]
+report = false
+min_points = 8
+max_points = 25
+max_skip = 8
+max_qrg = 1.3
+stability_windows = 3
+rg_tolerance = 0.02
+i0_tolerance = 0.03
+max_chi2 = 3.0
 
 [basis]
 n_basis = 20            # number of free cubic B-spline basis parameters
@@ -157,6 +211,10 @@ Resolution rule: explicit `n_basis` wins over `knot_spacing`. If `n_basis` is
 absent and `knot_spacing` is set, unFourier uses `ceil(Dmax / knot_spacing)`
 clamped to `[min_basis, max_basis]`. If neither is set, the default is
 `n_basis = 20`.
+
+For preprocessing, explicit CLI values win over TOML. In particular, `--qmin`
+prevents `auto_qmin = "guinier"` from mutating the low-q cutoff, and
+`--auto-qmin off` can disable a TOML `auto_qmin = "guinier"` setting for a run.
 
 ### Input format
 
@@ -185,6 +243,7 @@ UnFourier/
 │   ├── data.rs           # .dat parser, SaxsData struct
 │   ├── basis.rs          # BasisSet trait and CubicBSpline basis
 │   ├── bspline.rs        # Cox–de Boor B-spline evaluation and quadrature (M5)
+│   ├── guinier.rs        # 0.10 Guinier low-q preflight scanner
 │   ├── kernel.rs         # Weighted system matrix and back-calculation
 │   ├── solver.rs         # Solver trait, LeastSquaresSvd, TikhonovSolver
 │   ├── regularise.rs     # Regulariser trait + derivative penalties and
@@ -206,12 +265,16 @@ UnFourier/
 │   ├── monte_carlo_coverage.py# Bayesian spline error-bar coverage
 │   ├── parse_gnom.py          # Parse GNOM .out files for reference P(r)
 │   ├── validate_spline.py     # Spline-only synthetic regression checks
-│   └── validate_real_data.py  # M7/M8 validation against SASDME2, SASDF42, SASDYU3
+│   └── validate_real_data.py  # Real-data validation, including Guinier modes
 ├── data/
-│   └── dat_ref/               # Reference SAXS datasets (SASDME2, SASDF42, SASDYU3)
+│   └── dat_ref/               # Reference SAXS datasets
+├── docs2/
+│   ├── spec_0p10.md           # 0.10 Guinier preflight plan/status
+│   └── epic5_validation.md    # 0.10 Guinier guardrail results
 ├── pipeline.md           # Pipeline description with mathematics
 ├── MILESTONES.md         # Detailed milestone plan with rationale
-├── saxs_ift_postmortem.md# Mathematical analysis of sphere-data regularisation washout
+├── docs/
+│   └── saxs_ift_postmortem.md # Sphere-data regularisation washout analysis
 ├── Cargo.toml
 └── LICENSE               # GPLv3
 ```
@@ -220,7 +283,9 @@ UnFourier/
 
 ## Architecture
 
-The pipeline in `main.rs` is: **parse → preprocess → build basis → build system → solve coefficients → evaluate spline P(r) → output**.
+The pipeline in `main.rs` is: **parse → negative handling → optional Guinier
+preflight → q-range/SNR filtering → optional rebinning → build basis → build
+system → solve coefficients → evaluate spline P(r) → output**.
 
 Each stage is abstracted behind a trait, making the system extensible without modifying the pipeline:
 
@@ -228,6 +293,7 @@ Each stage is abstracted behind a trait, making the system extensible without mo
 |--------|-------|-----------------|
 | `data.rs` | — | `SaxsData`: holds q, I(q), σ(q); parses 3-column `.dat` files |
 | `basis.rs` | `BasisSet` | `CubicBSpline` (clamped B-splines) |
+| `guinier.rs` | — | Guinier low-q scan and recommendation logic |
 | `kernel.rs` | — | `build_weighted_system`, `back_calculate` |
 | `regularise.rs` | `Regulariser` | `SecondDerivative`, `FirstDerivative`, `CombinedDerivative`, `ProjectedSplineRegulariser` |
 | `solver.rs` | `Solver` | `LeastSquaresSvd` (M1), `TikhonovSolver` (M2+) |
@@ -249,15 +315,17 @@ python Dev/gen_debye.py --rg 30 --k 5 --output Dev/debye_k5.dat \
     --pr-reference Dev/debye_pr_ref.dat
 ```
 
-**Sphere (noiseless only):** The solid sphere has a fully analytic I(q) and P(r), making it a sharp test of kernel correctness. It is used without noise because the proportional noise model σ = I/k diverges at the sphere's exact intensity zeros, making any regulariser degenerate. See [saxs_ift_postmortem.md](saxs_ift_postmortem.md) for the analysis.
+**Sphere (noiseless only):** The solid sphere has a fully analytic I(q) and P(r), making it a sharp test of kernel correctness. It is used without noise because the proportional noise model σ = I/k diverges at the sphere's exact intensity zeros, making any regulariser degenerate. See [docs/saxs_ift_postmortem.md](docs/saxs_ift_postmortem.md) for the analysis.
 
-**Real SAXS data (M7/M8):** Three datasets from the SASBDB are used for end-to-end validation:
+**Real SAXS data:** Five datasets from the SASBDB are used for end-to-end validation:
 
 | Dataset | Description | Key challenge |
 |---------|-------------|---------------|
-| SASDME2 | Well-behaved protein | Baseline pass |
 | SASDF42 | Moderate signal-to-noise | Open right boundary, λ sensitivity |
-| SASDYU3 | Dense dataset (1696 points) | Requires log-rebinning |
+| SASDNF8 | Dense dataset | Large-N performance and rebin comparison |
+| SASDUD6 | Compact particle | Short Dmax and high-q weighting |
+| SASDYT6 | Low-q-sensitive dataset | Guinier auto-qmin changes the fit |
+| SASDYU3 | Dense dataset | Requires log-rebinning |
 
 Run the full validation suite with:
 
@@ -266,6 +334,7 @@ python Dev/validate_spline.py
 python Dev/sweep_noise.py
 python Dev/monte_carlo_coverage.py --n 200 --k 5 --n-basis 20
 python Dev/validate_real_data.py
+python Dev/validate_real_data.py --guinier-mode off --guinier-mode report --guinier-mode apply
 ```
 
 ---

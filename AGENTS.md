@@ -3,7 +3,7 @@
 This file is the quick project brief for coding agents working in this
 repository. It should be kept current and compact. Longer diagnostic notes live
 in `docs2/`, especially `docs2/CODEX.md` for the historical M8 boundary analysis
-and `docs2/spec_0p10.md` for the next planned iteration.
+and `docs2/spec_0p10.md` for the current 0.10 Guinier preflight iteration.
 
 ## Project Overview
 
@@ -46,8 +46,13 @@ target/release/unfourier data.dat --knot-spacing 7.5 --min-basis 12 --max-basis 
 # Preprocessing controls
 target/release/unfourier data.dat --qmin 0.01 --qmax 0.35 --snr-cutoff 1.0 --rebin 200 -o pr.dat
 
+# Guinier low-q preflight
+target/release/unfourier data.dat --guinier-report --rmax 150 -o pr.dat
+target/release/unfourier data.dat --auto-qmin guinier --guinier-report --rmax 150 -o pr.dat
+
 # Real-data validation against GNOM references
 python3 Dev/validate_real_data.py
+python3 Dev/validate_real_data.py --guinier-mode off --guinier-mode report --guinier-mode apply
 
 # Synthetic and exploratory validation
 python3 Dev/gen_debye.py
@@ -83,12 +88,14 @@ Preprocessing order is:
 
 ```text
 negative handling
+-> optional Guinier preflight report / auto-qmin
 -> q-range / SNR filtering
 -> log rebinning
 ```
 
-The planned 0.10 Guinier preflight should run after negative handling and before
-`QRangeSelector`.
+The 0.10 Guinier preflight runs after negative handling and before
+`QRangeSelector`. Report-only mode must not change the fit. Applied mode may set
+the effective `qmin` only when no explicit CLI or TOML `qmin` is already set.
 
 ## Module Map
 
@@ -97,6 +104,7 @@ The planned 0.10 Guinier preflight should run after negative handling and before
 | `src/data.rs` | `SaxsData`; lenient 3-column `.dat` parser for `q`, `I(q)`, `sigma` |
 | `src/basis.rs` | `BasisSet`; active `CubicBSpline`; boundary modes and free-to-full coefficient map |
 | `src/bspline.rs` | Clamped knot vectors, Greville points, B-spline evaluation, sinc-kernel integration |
+| `src/guinier.rs` | Side-effect-free Guinier scan, window rejection, and recommendation logic |
 | `src/kernel.rs` | Builds weighted systems from data and basis |
 | `src/regularise.rs` | `Regulariser`; projected spline D1/D2 smoothness, plus derivative helpers |
 | `src/solver.rs` | Tikhonov solve for manual lambda; Cholesky/LU linear solve plus projected-gradient NNLS |
@@ -169,6 +177,18 @@ lambda_max = 1e3
 qmin = 0.01
 qmax = 0.35
 negative_handling = "clip"  # clip | omit | keep
+auto_qmin = "off"           # off | guinier
+
+[guinier]
+report = false
+min_points = 8
+max_points = 25
+max_skip = 8
+max_qrg = 1.3
+stability_windows = 3
+rg_tolerance = 0.02
+i0_tolerance = 0.03
+max_chi2 = 3.0
 
 [basis]
 n_basis = 20
@@ -191,12 +211,27 @@ Important precedence:
 `lambda_min` and `lambda_max` affect only automatic lambda methods. They do not
 affect `--method manual --lambda ...`.
 
+`auto_qmin = "guinier"` is opt-in and experimental. It can be disabled for a
+single run with `--auto-qmin off`. Explicit `qmin`, from either CLI or TOML,
+prevents auto-qmin mutation; the report may still be printed.
+
 ## Validation Notes
 
 Use `Dev/validate_real_data.py` for the current five real-data fixtures in
 `data/dat_ref` and `data/prs_ref`. The script discovers matching `.dat`/`.out`
 pairs, writes both `P(r)` and fit files, and produces `Dev/validation_plot.png`
 with `P(r)`, `I(q)` fit, and endpoint diagnostics.
+
+For Guinier validation, run:
+
+```bash
+python3 Dev/validate_real_data.py --guinier-mode off --guinier-mode report --guinier-mode apply
+```
+
+The script checks that report-only output matches off mode exactly, records
+recommended/applied qmin values, and classifies applied mode as helped, hurt,
+mixed, or did nothing. The latest Epic 5 guardrail run is summarized in
+`docs2/epic5_validation.md`.
 
 Use Debye-chain synthetic data as the primary noisy benchmark. Use sphere data
 only for kernel/evaluation sanity checks; proportional noise around sphere-form
@@ -216,13 +251,16 @@ and does not include regularisation bias, so coverage is expected to be imperfec
 4. Boundary conditions represented in the spline coefficient map.
 5. Projected D1/D2 regularisation through the same map.
 
-0.10 planning is in `docs2/spec_0p10.md`. The next feature is a Guinier low-q
+0.10 planning is in `docs2/spec_0p10.md`. The current feature is a Guinier low-q
 preflight:
 
 1. Report-only scan over increasing low-q truncations.
 2. Optional `--auto-qmin guinier` mutation mode.
 3. Explicit `--qmin` must win over automatic suggestions.
 4. No promise that automatic trimming is generally reliable before 1.0.
+
+The 0.10 user-facing docs now cover the preflight. Remaining work should be
+limited to final polish from validation or user review.
 
 ## Development Cautions
 

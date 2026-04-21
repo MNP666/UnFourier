@@ -4,7 +4,7 @@ This document describes every stage of the IFT pipeline — what it computes, wh
 and the mathematics behind it.  The implementation follows the same order:
 
 ```
-parse → preprocess → basis → build system → regularise → λ selection → solve → non-negativity → output
+parse → preprocess (negative handling → Guinier preflight → q filters → rebin) → basis → build system → regularise → λ selection → solve → non-negativity → output
 ```
 
 ---
@@ -43,7 +43,54 @@ Background subtraction can produce I(q) ≤ 0. Three strategies are available:
 | `omit` | Discard points with I ≤ 0 entirely. |
 | `keep` | Leave values unchanged. Only safe when all I > 0 is guaranteed. |
 
-### 2b  q-range and SNR selection
+### 2b  Guinier low-q preflight
+
+The 0.10 Guinier preflight is an experimental diagnostic for low-q data quality.
+It runs after negative-intensity handling and before q-range/SNR selection, so an
+applied recommendation becomes the effective `q_min` used by the existing
+`QRangeSelector`.
+
+The scanner fits the linearised Guinier relation on increasing low-q
+truncations:
+
+```
+I(q) = I0 · exp(-(Rg² q²) / 3)
+ln I(q) = ln I0 - Rg² q² / 3
+```
+
+For each candidate window it uses weighted least squares on:
+
+```
+x = q²
+y = ln I(q)
+σ_y ≈ σ_I / I
+weight = 1 / σ_y²
+```
+
+Candidate windows are rejected when inputs are non-finite, intensities are
+non-positive, σ is invalid, the fitted slope is positive, `q_max · Rg` exceeds
+the configured Guinier range, or the reduced chi-squared is too high. The scan
+then looks for the earliest sequence of valid skipped windows where both `Rg`
+and `I0` are stable within configured relative tolerances.
+
+There are two user-facing modes:
+
+| Mode | Controls | Pipeline effect |
+|------|----------|-----------------|
+| Report only | `--guinier-report` or `[guinier].report = true` | Prints the table and recommendation, but does not mutate data. |
+| Applied | `--auto-qmin guinier` or `[preprocessing].auto_qmin = "guinier"` | Sets `q_min` to the recommendation only when the user has not supplied `--qmin` or `[preprocessing].qmin`. |
+
+Explicit `qmin` always wins. If no stable recommendation exists, the pipeline
+continues without an automatic low-q cutoff and reports that no mutation was
+made. When `rmax` is not supplied, it is still computed later from the actual
+post-filtering low-q edge, so an applied Guinier cutoff can affect the automatic
+`rmax = π / q_min` estimate.
+
+The feature is intentionally conservative: applied mode is opt-in, the report is
+human-readable, and 0.10 does not claim that automatic trimming is generally
+reliable.
+
+### 2c  q-range and SNR selection
 
 Three optional cuts, applied in sequence:
 
@@ -53,7 +100,7 @@ Three optional cuts, applied in sequence:
    points where `I(q)/σ(q) < snr_threshold`.  Removes the noisy high-q tail
    without a manual `q_max`.
 
-### 2c  Logarithmic rebinning
+### 2d  Logarithmic rebinning
 
 For dense datasets (e.g. 1696 points) the solver is overconstrained relative to
 the number of basis functions, and the grid search can be slow.  Log-rebinning
@@ -479,8 +526,10 @@ parameterisation rather than appended rows.
               ┌─────────────▼───────────────┐
               │  PREPROCESS                  │
               │  1. Clip / omit negatives    │
-              │  2. q-range / SNR filter     │
-              │  3. Log-rebin (optional)     │
+              │  2. Guinier preflight        │
+              │     report or auto-qmin      │
+              │  3. q-range / SNR filter     │
+              │  4. Log-rebin (optional)     │
               └─────────────┬───────────────┘
                             │
               ┌─────────────▼───────────────┐

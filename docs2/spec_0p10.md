@@ -12,8 +12,8 @@ the suggested low-q cutoff as the effective `qmin`.
 
 ## Implementation Status
 
-Epic 1, Epic 2, Epic 3, Epic 4, and Epic 5 are implemented. The remaining 0.10
-work starts at Epic 6: user-facing and developer documentation.
+Epic 1, Epic 2, Epic 3, Epic 4, Epic 5, and Epic 6 are implemented. Remaining
+0.10 work should be limited to final polish from validation or review.
 
 ## Goals
 
@@ -425,6 +425,13 @@ Acceptance:
 
 Document the feature as an experimental assistant, not an oracle.
 
+Current implementation: `README.md` documents the user-facing Guinier preflight
+commands, report-only vs applied behavior, TOML settings, pipeline placement,
+and explicit-qmin precedence. `pipeline.md` documents the mathematical model,
+candidate rejection rules, and exact preprocessing placement. `AGENTS.md`
+documents agent-facing commands, validation expectations, and known applied-mode
+cautions.
+
 ### Issue 6.1: README and pipeline docs
 
 Tasks:
@@ -463,16 +470,16 @@ Acceptance:
 5. Done: Epic 2.2, add TOML config.
 6. Done: Epic 4, update validation scripts.
 7. Done: Epic 5, add guardrail tests and run off/report/apply validation.
-8. Epic 6: update active docs.
+8. Done: Epic 6, update README, pipeline docs, and AGENTS guidance.
 
-## Open Questions
+## 0.10 Decisions
 
-1. Should `max_chi2` be a hard rejection or only part of confidence labeling?
-2. Should the stabilization rule use consecutive skip windows or any local
-   plateau in sorted skip order?
-3. Should report-only mode print by default when `--verbose` is set, or only when
-   explicitly requested?
-4. Should applied auto-qmin be available from TOML, or should mutation require an
-   explicit CLI flag during 0.10?
-5. Should validation compare auto-qmin against GNOM's chosen low-q range where
-   that metadata is available?
+1. `max_chi2` is a hard rejection threshold for candidate windows.
+2. The stability rule uses consecutive skip windows.
+3. The text report prints when `--guinier-report` is set; verbose mode also
+   includes the report when `--auto-qmin guinier` is active.
+4. Applied auto-qmin is available from TOML through
+   `preprocessing.auto_qmin = "guinier"`, but can be disabled by CLI
+   `--auto-qmin off`.
+5. Future validation may compare auto-qmin against GNOM's chosen low-q range if
+   that metadata is available.
